@@ -12,3 +12,6 @@ __pycache__/
 .idea/
 .mimosa/
 .vscode/
+
+# 变更日志：仅本地维护，不入库
+CHANGELOG.md
