@@ -54,8 +54,19 @@ SUB_SYSTEM_PROMPT = (
     "3. 涉及总花费/接单/打款等汇总类问题，调用 ask_master 转交上级回答，不要自己估算；\n"
     "4. 员工反馈达人接单/拒接时调用 update_order_status；反馈钱已打款时调用 mark_paid；\n"
     "5. 写入前如担心重复，可先调用 lookup_promo_table 查重（名单内达人会带报价/抖音号）；\n"
-    "6. 最终回复用简体中文，简洁汇报你做了什么、结果如何。"
+    "6. 业务概念/流程不确定时调用 search_knowledge 检索知识库；\n"
+    "7. 最终回复用简体中文，简洁汇报你做了什么、结果如何。"
 )
+
+try:
+    from promo_agent import knowledge as _kb
+    _KB_DIGEST = _kb.digest()
+    if _KB_DIGEST:
+        SUB_SYSTEM_PROMPT += (
+            f"\n\n【团队知识库摘要】{_KB_DIGEST}。\n"
+            "以上概念的细节可调用 search_knowledge 检索知识库后回答。")
+except Exception:
+    _KB_DIGEST = ""
 
 
 class SubAgent:
@@ -65,22 +76,35 @@ class SubAgent:
         self.client = client or FeishuClient()
 
     # ---------- Agent 路径：LLM 工具循环 ----------
-    def handle_text(self, text: str) -> str:
-        """任意口语化消息 -> LLM 理解 -> 自主调用工具 -> 自然语言回复。"""
+    def handle_text(self, text: str, chat_id: str = "") -> str:
+        """任意口语化消息 -> 会话记忆 + LLM 理解 -> 自主调用工具 -> 自然语言回复。"""
         import time as _time
         from promo_agent.llm_client import run_tool_loop, llm_ready
+        from promo_agent import memory, observability as obs
         if not llm_ready():
             return ("（未配置 LLM Key，Agent 路径不可用。请在 .env 填写 "
                     "LLM_BASE_URL / LLM_API_KEY / LLM_MODEL，或先用规则兜底：python -m main demo）")
+        run_id = obs.new_run_id("group" if chat_id else "cli")
+        obs.set_current_run(run_id)
+        obs.log_event("agent_run_start", run_id=run_id, message=text[:120])
         t0 = _time.time()
-        messages = [{"role": "system", "content": SUB_SYSTEM_PROMPT},
-                    {"role": "user", "content": text}]
+        history = memory.get_recent_turns(chat_id, 6)
+        if history:
+            obs.log_event("memory_context", run_id=run_id, turns=len(history))
+        messages = [{"role": "system", "content": SUB_SYSTEM_PROMPT}]
+        messages += history
+        messages.append({"role": "user", "content": text})
         reply = run_tool_loop(
             messages, SUB_TOOLS, SubToolExecutor(self).run_tool,
             answer_key="answer_text",   # 确认/转交类回复由代码直出，省一轮组稿
             on_step=lambda fn, a: print(f"[{self.name}] 🔧 工具调用 {fn} "
                                         + json.dumps(a, ensure_ascii=False)))
-        print(f"[{self.name}] ⏱ 本条消息处理用时 {_time.time() - t0:.1f}s")
+        memory.add_chat_turn(chat_id, "user", text)
+        memory.add_chat_turn(chat_id, "assistant", reply)
+        elapsed = _time.time() - t0
+        obs.observe_agent_run(run_id, elapsed)
+        obs.log_event("agent_reply", run_id=run_id, reply=reply[:200])
+        print(f"[{self.name}] ⏱ 本条消息处理用时 {elapsed:.1f}s（run_id={run_id}）")
         return reply
 
     # ---------- 事件上报（工具 notify_master 的底层实现）----------
@@ -172,6 +196,14 @@ class SubToolExecutor:
                 from promo_agent.master_agent import handle_question
                 reply = handle_question(v.clean_text(params, "question", 500))
                 return {"master_reply": reply, "answer_text": reply}
+            if tool_name == "search_knowledge":
+                from promo_agent import knowledge
+                return {"results": knowledge.search(
+                    str(params.get("query") or ""), int(params.get("top_k") or 3))}
+            if tool_name == "recall_recent_applications":
+                from promo_agent import memory
+                return {"recent_applications": memory.recent_applications(
+                    max(1, min(int(params.get("n") or 5), 20)))}
         except ValueError as err:
             return {"error": "参数校验失败: " + str(err)}
         return {"error": "不支持的工具: " + str(tool_name)[:40]}
@@ -236,6 +268,13 @@ class SubToolExecutor:
         )
         self.agent.notify_master(ev)
         _run_master_async(self.client)   # 聚合/日报转后台，不阻塞回复
+        # 写入操作记忆：支持“刚才那笔”类召回与后续修改
+        from promo_agent import memory
+        memory.add_application({
+            "song": song, "blogger": blogger, "app_type": app_type,
+            "amount": amount, "tx_count": tx_count, "payer": payer,
+            "date": date, "record_id": rid,
+        })
         return {"status": "ok", "type": app_type, "row_key": rec.row_key,
                 "amount": rec.amount, "tx_count": rec.tx_count, "record_id": rid,
                 "answer_text": (f"已为《{song}》的「{blogger}」记录{label}申请"
@@ -243,6 +282,6 @@ class SubToolExecutor:
                                 f"并已上报 Master-Agent 汇总，推广日报稍后推送。")}
 
 
-def handle_text_wrap(text: str) -> str:
+def handle_text_wrap(text: str, chat_id: str = "") -> str:
     """模块级便捷入口：默认客户端跑一轮 Sub-Agent。"""
-    return SubAgent().handle_text(text)
+    return SubAgent().handle_text(text, chat_id)

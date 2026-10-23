@@ -256,7 +256,7 @@ class MasterToolExecutor:
                 reports = MasterAgent(self.client).run(send_report=True)
                 return {"reports": [r.to_dict() for r in reports] or ["暂无未汇总事件"]}
             if tool_name == "query_daily_reports":
-                return self.client.fetch_mgmt_rows(
+                result = self.client.fetch_mgmt_rows(
                     song=str(params.get("song") or ""),
                     date=str(params.get("date") or ""))
                 if not result.get("reports"):
@@ -264,12 +264,17 @@ class MasterToolExecutor:
                     pending = MasterAgent(self.client).run(send_report=False)
                     if pending:
                         result = self.client.fetch_mgmt_rows(
-                            song=str(params.get("song") or ""))
+                            song=str(params.get("song") or ""),
+                            date=str(params.get("date") or ""))
                 return result
             if tool_name == "lookup_promo_table":
                 return self.client.fetch_promo_rows(
                     song=str(params.get("song") or ""),
                     blogger=str(params.get("blogger") or ""))
+            if tool_name == "search_knowledge":
+                from promo_agent import knowledge
+                return {"results": knowledge.search(
+                    str(params.get("query") or ""), int(params.get("top_k") or 3))}
         except ValueError as err:
             return {"error": "参数校验失败: " + str(err)}
         return {"error": "不支持的工具: " + str(tool_name)[:40]}
@@ -277,13 +282,22 @@ class MasterToolExecutor:
 
 def handle_question(question: str, client: FeishuClient = None) -> str:
     """Master-Agent 的对话入口：管理者的自然语言问题 -> 查表聚合 -> 自然语言回答。"""
+    import time as _time
     from promo_agent.llm_client import run_tool_loop, llm_ready
+    from promo_agent import observability as obs
     if not llm_ready():
         return "（未配置 LLM，无法智能问答。可运行 python -m main summary 生成规则版日报）"
+    run_id = obs.new_run_id("master")
+    obs.set_current_run(run_id)
+    obs.log_event("master_question", run_id=run_id, question=question[:120])
+    t0 = _time.time()
     messages = [{"role": "system", "content": MASTER_SYSTEM_PROMPT},
                 {"role": "user", "content": question}]
-    return run_tool_loop(
+    answer = run_tool_loop(
         messages, MASTER_TOOLS, MasterToolExecutor(client).run_tool,
         answer_key="answer_text",   # 代码预渲染的答案直通，杜绝模型改数编名
         on_step=lambda fn, a: print(f"[{config.MASTER_AGENT_NAME}] 🔧 工具调用 {fn} "
                                     + json.dumps(a, ensure_ascii=False)))
+    obs.log_event("master_answer", run_id=run_id, answer=answer[:200],
+                  latency_s=round(_time.time() - t0, 2))
+    return answer

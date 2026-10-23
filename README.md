@@ -27,6 +27,9 @@
 - ⏰ **日终汇总**：每晚 23:00 对当日全部申请做全量重算并推送终版日报
 - 🔌 **模型可插拔**：支持 GLM / DeepSeek / Kimi 等任意 OpenAI 兼容服务，改一行配置切换
 - 🧪 **离线模拟模式**：不接真实飞书也能完整演示读写与消息流
+- 📚 **知识库**：`data/knowledge/*.md` 维护业务术语与流程，提示词注入摘要 + `search_knowledge` 工具检索，热更新
+- 🧠 **记忆系统**：每个群的会话记忆（支持"再上一笔"类指代）+ 申请操作记忆（"刚才那笔"召回），持久化到本地
+- 🔭 **可观测**：结构化运行日志（JSONL）、指标快照（消息/LLM/工具/错误率）、`trace` 命令回放单次处理时间线
 
 ## 架构
 
@@ -159,6 +162,9 @@ python -m main listen      # 常驻进程：@机器人 消息实时触发 + 每�
 | `python -m main seed-roster` | 预置达人名单（幂等） |
 | `python -m main rebuild` | 从事件总线全量重算日报 |
 | `python -m main reset` | 清空表格记录与事件状态 |
+| `python -m main metrics` | 查看可观测指标（消息/LLM/工具/错误率） |
+| `python -m main trace [run_id]` | 回放一次 Agent 处理的完整时间线（`last`=最近一次） |
+| `python -m main kb "抖加和垫付的区别"` | 检索知识库（调试） |
 
 ## Agent 工具一览
 
@@ -219,9 +225,13 @@ feishu-promo-agents/
 │   ├── agent_tools.py       #   工具清单（JSON Schema）
 │   ├── sub_agent.py         #   Sub-Agent「推广助手」
 │   ├── master_agent.py      #   Master-Agent「综合助手」
-│   └── listener.py          #   长连接监听（路由/去重/并发/定时）
+│   ├── listener.py          #   长连接监听（路由/去重/并发/定时）
+│   ├── knowledge.py         #   知识库检索（热更新）
+│   ├── memory.py            #   会话记忆 + 操作记忆
+│   └── observability.py     #   结构化日志/指标/追踪
 ├── data/
 │   ├── roster.json          #   达人名单（seed-roster 预置用）
+│   ├── knowledge/           #   知识库内容（Markdown，可直接编辑扩充）
 │   └── samples/             #   申请总结样例
 ├── scripts/                 # 启动脚本（前台/静默）
 ├── state/                   # 运行时产物（不入库）

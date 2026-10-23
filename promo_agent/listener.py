@@ -144,6 +144,7 @@ def run():
 
     def on_message(data):
         try:
+            from promo_agent import observability as obs
             msg = data.event.message
             ev_key = getattr(getattr(data, "header", None), "event_id", "") \
                 or getattr(msg, "message_id", "")
@@ -156,6 +157,7 @@ def run():
             text = _clean_text(json.loads(msg.content).get("text", ""), names)
             if not text:
                 return
+            obs.observe_message()
             print(f"\n[监听] 收到群消息：{text[:80]}")
             pool.submit(_process, text, msg.chat_id)   # 并发处理，不阻塞下一条消息
         except Exception as e:

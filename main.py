@@ -156,8 +156,9 @@ def cmd_seed_roster(args):
 
 
 def cmd_reset(args):
-    """清空两张表的记录 + 重置事件总线/去重缓存，准备全新测试（表格与字段保留）。"""
-    for fname in ("events.jsonl", "processed_events.json", "seen_events.json", "mock_feishu.json"):
+    """清空两张表的记录 + 重置事件总线/去重缓存/记忆，准备全新测试（表格与字段保留）。"""
+    for fname in ("events.jsonl", "processed_events.json", "seen_events.json",
+                  "mock_feishu.json", "memory_chat.json", "memory_ops.json"):
         p = config.STATE_DIR / fname
         if p.exists():
             p.unlink()
@@ -176,6 +177,43 @@ def cmd_rebuild(args):
     """从事件总线全量重算《综合管理表》（修复历史数据）。"""
     reports = MasterAgent().rebuild()
     print(f"✅ 已重算 {len(reports)} 条日报。")
+
+
+def cmd_metrics(args):
+    """查看可观测指标（消息数/LLM 调用/工具调用/错误率）。"""
+    from promo_agent import observability as obs
+    print(obs.render_metrics())
+
+
+def cmd_trace(args):
+    """按 run_id 回放一次 Agent 处理的完整步骤时间线。"""
+    from promo_agent import observability as obs
+    run_id = args.run_id
+    if run_id == "last":
+        runs = [o for o in obs.tail_runs(200) if o.get("event") == "agent_run_start"]
+        if not runs:
+            sys.exit("暂无运行记录（state/obs_runs.jsonl 为空）。")
+        run_id = runs[-1]["run_id"]
+        print(f"（最近一次运行：{run_id}）")
+    trace = obs.get_run(run_id)
+    if not trace:
+        sys.exit(f"未找到 run_id={run_id} 的运行记录。")
+    print(f"Run {run_id} 共 {len(trace)} 步：")
+    for o in trace:
+        extra = " ".join(f"{k}={v}" for k, v in o.items()
+                         if k not in ("ts", "run_id", "event") and v != "")
+        print(f"  [{o['ts'][11:23]}] {o['event']}  {extra[:140]}")
+
+
+def cmd_knowledge(args):
+    """检索知识库（调试用）。"""
+    from promo_agent import knowledge
+    hits = knowledge.search(args.query, args.top_k)
+    if not hits:
+        print("没有命中的知识条目。")
+        return
+    for h in hits:
+        print(f"\n【{h['title']}】(来源: {h['source']})\n{h['text']}")
 
 
 def cmd_setup(args):
@@ -225,6 +263,14 @@ def main():
     sub.add_parser("reset", help="清空表格记录与事件状态（全新测试）").set_defaults(func=cmd_reset)
     sub.add_parser("setup", help="真实模式一键建表").set_defaults(func=cmd_setup)
     sub.add_parser("check", help="连通性自检").set_defaults(func=cmd_check)
+    sub.add_parser("metrics", help="查看可观测指标").set_defaults(func=cmd_metrics)
+    p = sub.add_parser("trace", help="按 run_id 回放运行时间线（last=最近一次）")
+    p.add_argument("run_id", nargs="?", default="last")
+    p.set_defaults(func=cmd_trace)
+    p = sub.add_parser("kb", help="检索知识库（调试用）")
+    p.add_argument("query")
+    p.add_argument("--top-k", type=int, default=3)
+    p.set_defaults(func=cmd_knowledge)
     args = ap.parse_args()
     args.func(args)
 

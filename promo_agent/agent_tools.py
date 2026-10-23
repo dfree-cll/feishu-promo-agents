@@ -80,5 +80,24 @@ QUERY_REPORTS = {
     }},
 }
 
-SUB_TOOLS = [SUBMIT_APPLICATION, LOOKUP, UPDATE_ORDER, MARK_PAID, ASK_MASTER]
-MASTER_TOOLS = [SUMMARIZE, QUERY_REPORTS, LOOKUP]
+SEARCH_KB = {
+    "name": "search_knowledge",
+    "description": "检索团队知识库（业务术语/流程/FAQ）。对业务概念、角色区分、流程规则"
+                   "不确定时调用，例如“抖加和垫付的区别”“预计打款日期格式”。",
+    "parameters": {"type": "object", "properties": {
+        "query": {"type": "string", "description": "要检索的问题或关键词"},
+        "top_k": {"type": "integer", "description": "返回条数，默认3"},
+    }, "required": ["query"]},
+}
+RECENT_APPS = {
+    "name": "recall_recent_applications",
+    "description": "回忆最近写入的费用申请（短期操作记忆）。当用户说“刚才那笔”"
+                   "“最近一笔”这类指代，或需要确认刚刚提交的内容时调用。",
+    "parameters": {"type": "object", "properties": {
+        "n": {"type": "integer", "description": "返回条数，默认5"},
+    }},
+}
+
+SUB_TOOLS = [SUBMIT_APPLICATION, LOOKUP, UPDATE_ORDER, MARK_PAID,
+             RECENT_APPS, SEARCH_KB, ASK_MASTER]
+MASTER_TOOLS = [SUMMARIZE, QUERY_REPORTS, LOOKUP, SEARCH_KB]
