@@ -27,6 +27,8 @@ PROMO_FIELDS = [
     {"field_name": "预计打款日期", "type": T_DATE, "property": {"date_formatter": "yyyy/MM/dd", "auto_fill": False}},
     {"field_name": "实际打款日期", "type": T_DATE, "property": {"date_formatter": "yyyy/MM/dd", "auto_fill": False}},
     {"field_name": "是否接单", "type": T_SELECT, "property": {"options": [{"name": "已接单"}, {"name": "待确认"}, {"name": "已拒绝"}]}},
+    {"field_name": "审核状态", "type": T_SELECT, "property": {"options": [{"name": "待审核"}, {"name": "已批准"}, {"name": "已驳回"}]}},
+    {"field_name": "审核备注", "type": T_TEXT},
     {"field_name": "申请日期", "type": T_DATE, "property": {"date_formatter": "yyyy/MM/dd", "auto_fill": False}},
     {"field_name": "来源",     "type": T_TEXT},
 ]
@@ -77,6 +79,7 @@ def promo_record_fields(rec_dict: dict) -> dict:
         "博主名": rec_dict["blogger"],
         "申请日期": _ts(rec_dict["summary_date"]),
         "来源": rec_dict.get("source", ""),
+        "审核状态": "待审核",
     }
     if rec_dict["app_type"] == "doujia":
         f.update({

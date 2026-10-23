@@ -79,7 +79,8 @@ def run():
     sub, master, client = SubAgent(), MasterAgent(), FeishuClient()
     seen = SeenCache()
     # 多人同时发消息：每条消息一个工作线程并行处理（I/O 密集，线程池即可）
-    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="msg")
+    pool = ThreadPoolExecutor(max_workers=config.LISTEN_WORKERS,
+                              thread_name_prefix="msg")
     footer_cache: dict = {}
 
     def table_urls() -> tuple:
@@ -104,7 +105,7 @@ def run():
         return (f"\n\n📊 [打开《推广账号表》]({promo_url})"
                 f" ｜ 📈 [打开《综合管理表》]({mgmt_url})")
 
-    def _process(text: str, chat_id: str):
+    def _process(text: str, chat_id: str, sender: str = ""):
         try:
             print(f"\n[监听] 开始处理：{text[:80]}")
 
@@ -122,7 +123,7 @@ def run():
                 ack_id = client.send_card("⏳ 收到，正在处理…",
                                           f"消息：{text[:80]}",
                                           template="grey", to_chat_id=chat_id)
-                reply = sub.handle_text(text)
+                reply = sub.handle_text(text, chat_id, sender)
                 markdown = reply + table_footer()
                 done = False
                 if ack_id:
@@ -157,9 +158,14 @@ def run():
             text = _clean_text(json.loads(msg.content).get("text", ""), names)
             if not text:
                 return
+            sender = ""
+            try:
+                sender = data.event.sender.sender_id.open_id
+            except AttributeError:
+                pass
             obs.observe_message()
             print(f"\n[监听] 收到群消息：{text[:80]}")
-            pool.submit(_process, text, msg.chat_id)   # 并发处理，不阻塞下一条消息
+            pool.submit(_process, text, msg.chat_id, sender)   # 并发处理，不阻塞下一条消息
         except Exception as e:
             print(f"[监听] 事件分发出错：{e}")
 

@@ -11,9 +11,10 @@ Sub-Agent「推广助手」——真正的 LLM Agent：
 import json
 import threading
 from datetime import date as _date
-from typing import List
+from typing import List, Optional
 
 from promo_agent import config
+from promo_agent import memory
 from promo_agent.agent_tools import SUB_TOOLS
 from promo_agent.feishu_client import FeishuClient
 from promo_agent.extractor import parse_any
@@ -76,7 +77,7 @@ class SubAgent:
         self.client = client or FeishuClient()
 
     # ---------- Agent 路径：LLM 工具循环 ----------
-    def handle_text(self, text: str, chat_id: str = "") -> str:
+    def handle_text(self, text: str, chat_id: str = "", sender: str = "") -> str:
         """任意口语化消息 -> 会话记忆 + LLM 理解 -> 自主调用工具 -> 自然语言回复。"""
         import time as _time
         from promo_agent.llm_client import run_tool_loop, llm_ready
@@ -86,7 +87,7 @@ class SubAgent:
                     "LLM_BASE_URL / LLM_API_KEY / LLM_MODEL，或先用规则兜底：python -m main demo）")
         run_id = obs.new_run_id("group" if chat_id else "cli")
         obs.set_current_run(run_id)
-        obs.log_event("agent_run_start", run_id=run_id, message=text[:120])
+        obs.log_event("agent_run_start", run_id=run_id, message=text[:120], sender=sender)
         t0 = _time.time()
         history = memory.get_recent_turns(chat_id, 6)
         if history:
@@ -94,8 +95,9 @@ class SubAgent:
         messages = [{"role": "system", "content": SUB_SYSTEM_PROMPT}]
         messages += history
         messages.append({"role": "user", "content": text})
+        executor = SubToolExecutor(self).bind(chat_id=chat_id, sender=sender)
         reply = run_tool_loop(
-            messages, SUB_TOOLS, SubToolExecutor(self).run_tool,
+            messages, SUB_TOOLS, executor.run_tool,
             answer_key="answer_text",   # 确认/转交类回复由代码直出，省一轮组稿
             on_step=lambda fn, a: print(f"[{self.name}] 🔧 工具调用 {fn} "
                                         + json.dumps(a, ensure_ascii=False)))
@@ -131,6 +133,8 @@ class SubAgent:
                 fields = promo_record_fields(rec.to_dict())
                 rid = self.client.upsert_record(
                     app_token, table_id, "行键", rec.row_key, fields)
+                from promo_agent import memory
+                memory.add_status_change(rec.row_key, "审核状态", "", "待审核")
                 written += 1
                 print(f"[{self.name}] ✅ 已写入《推广账号表》 {rec.blogger} "
                       f"({rec.amount:g}元/{rec.tx_count}笔) -> {rid}")
@@ -157,17 +161,35 @@ class SubAgent:
 
 
 class SubToolExecutor:
-    """LLM 工具调用入口：参数先过 validators 白名单，再以显式命名参数分派。"""
+    """LLM 工具调用入口：参数先过 validators 白名单，再以显式命名参数分派。
+
+    bind(chat_id, sender)：chat_id 用于审批卡回发；sender 用于审核/回滚类
+    管理者指令的身份校验（配合 config.APPROVER_OPEN_IDS）。
+    """
 
     def __init__(self, agent: SubAgent):
         self.agent = agent
         self.client = agent.client
+        self.chat_id = ""
+        self.sender = ""
+
+    def bind(self, chat_id: str = "", sender: str = "") -> "SubToolExecutor":
+        self.chat_id = chat_id or self.chat_id
+        self.sender = sender or self.sender
+        return self
+
+    def _require_manager(self) -> Optional[dict]:
+        """审核/回滚属管理者指令：配置了 APPROVER_OPEN_IDS 时校验发送者身份。"""
+        if config.APPROVER_OPEN_IDS and self.sender and self.sender not in config.APPROVER_OPEN_IDS:
+            return {"error": "只有管理者可以执行审核/回滚操作。"}
+        return None
 
     def run_tool(self, tool_name: str, params: dict) -> dict:
         from promo_agent import validators as v
         try:
             if tool_name == "submit_application":
-                return self.submit_application(**v.validate_submit_args(params, TODAY))
+                clean = v.validate_submit_args(params, TODAY)
+                return self.submit_application(**clean)
             if tool_name == "lookup_promo_table":
                 return self.client.fetch_promo_rows(
                     song=str(params.get("song") or ""),
@@ -192,6 +214,24 @@ class SubToolExecutor:
                     out["answer_text"] = (f"已将《{song}》的「{blogger}」标记为已打款"
                                           f"（实际打款日期：{out['paid_date']}）。")
                 return out
+            if tool_name == "review_application":
+                denied = self._require_manager()
+                if denied:
+                    return denied
+                clean = v.validate_review_args(params)
+                return self.review_application(
+                    song=v.clean_text(params, "song"),
+                    blogger=v.clean_text(params, "blogger"),
+                    decision=clean["decision"], reason=clean["reason"])
+            if tool_name == "rollback_last_change":
+                denied = self._require_manager()
+                if denied:
+                    return denied
+                clean = v.validate_rollback_args(params)
+                return self.rollback_last_change(
+                    song=v.clean_text(params, "song"),
+                    blogger=v.clean_text(params, "blogger"),
+                    field=clean["field"])
             if tool_name == "ask_master":
                 from promo_agent.master_agent import handle_question
                 reply = handle_question(v.clean_text(params, "question", 500))
@@ -226,24 +266,30 @@ class SubToolExecutor:
         key = song + "|" + blogger
         app_token = self.client.ensure_bitable()
         table_id = self.client.ensure_table(app_token, PROMO_TABLE, PROMO_FIELDS)
-        rid, _old = self.client.find_record(app_token, table_id, "行键", key)
+        rid, old = self.client.find_record(app_token, table_id, "行键", key)
         if rid is None:
             return {"error": "《推广账号表》中没有 " + key + " 的申请记录，请先提交申请"}
+        old_status = self.client._to_write_format((old or {}).get("是否接单", "")) or "待确认"
         self.client.upsert_record(app_token, table_id, "行键", key,
                                   {"行键": key, "是否接单": status})
+        from promo_agent import memory
+        memory.add_status_change(key, "是否接单", old_status, status)
         return {"status": "ok", "row_key": key, "order_status": status}
 
     def mark_paid(self, song: str, blogger: str, paid_date: str) -> dict:
         key = song + "|" + blogger
         app_token = self.client.ensure_bitable()
         table_id = self.client.ensure_table(app_token, PROMO_TABLE, PROMO_FIELDS)
-        rid, _old = self.client.find_record(app_token, table_id, "行键", key)
+        rid, old = self.client.find_record(app_token, table_id, "行键", key)
         if rid is None:
             return {"error": "《推广账号表》中没有 " + key + " 的申请记录，请先提交申请"}
         from datetime import datetime as _dt
         ts = int(_dt.strptime(paid_date, "%Y-%m-%d").timestamp() * 1000)
+        old_pay = self.client._to_write_format((old or {}).get("是否打款", "")) or "待打款"
         self.client.upsert_record(app_token, table_id, "行键", key,
                                   {"行键": key, "是否打款": "已打款", "实际打款日期": ts})
+        from promo_agent import memory
+        memory.add_status_change(key, "是否打款", old_pay, "已打款")
         return {"status": "ok", "row_key": key, "paid": True, "paid_date": paid_date}
 
     def submit_application(self, app_type: str, song: str, blogger: str, amount: float,
@@ -257,8 +303,11 @@ class SubToolExecutor:
                                 expected_pay_date=expected_pay_date)
         app_token = self.client.ensure_bitable()
         table_id = self.client.ensure_table(app_token, PROMO_TABLE, PROMO_FIELDS)
+        fields = promo_record_fields(rec.to_dict())
+        fields["审核状态"] = "待审核"
         rid = self.client.upsert_record(app_token, table_id, "行键",
-                                        rec.row_key, promo_record_fields(rec.to_dict()))
+                                        rec.row_key, fields)
+        memory.add_status_change(rec.row_key, "审核状态", "", "待审核")
         label = "抖加" if app_type == "doujia" else "垫付"
         role_label = "支付人" if app_type == "doujia" else "打款人"
         ev = SummaryEvent(
@@ -268,18 +317,65 @@ class SubToolExecutor:
         )
         self.agent.notify_master(ev)
         _run_master_async(self.client)   # 聚合/日报转后台，不阻塞回复
+        # 审批请求卡：提醒管理者处理
+        self.client.send_card(
+            f"🔔 待审核：{label}申请「{blogger}」",
+            f"**歌曲**：《{song}》　**博主**：{blogger}\n"
+            f"**金额**：¥{amount:g}（{tx_count} 笔）　**{role_label}**：{payer}\n"
+            + (f"**预计打款日期**：{expected_pay_date}\n" if expected_pay_date else "")
+            + "\n管理者请回复：**同意 " + blogger + "** 或 **驳回 " + blogger + " [原因]**",
+            template="yellow", to_chat_id=self.chat_id)
         # 写入操作记忆：支持“刚才那笔”类召回与后续修改
-        from promo_agent import memory
         memory.add_application({
             "song": song, "blogger": blogger, "app_type": app_type,
             "amount": amount, "tx_count": tx_count, "payer": payer,
             "date": date, "record_id": rid,
         })
-        return {"status": "ok", "type": app_type, "row_key": rec.row_key,
+        return {"status": "ok", "review": "待审核", "type": app_type,
+                "row_key": rec.row_key,
                 "amount": rec.amount, "tx_count": rec.tx_count, "record_id": rid,
                 "answer_text": (f"已为《{song}》的「{blogger}」记录{label}申请"
-                                f"¥{amount:g}（{tx_count} 笔），{role_label}：{payer}，"
-                                f"并已上报 Master-Agent 汇总，推广日报稍后推送。")}
+                                f"¥{amount:g}（{tx_count} 笔），{role_label}：{payer}。"
+                                f"申请已进入待审核状态，等管理者确认后正式生效。")}
+
+    def review_application(self, song: str, blogger: str, decision: str,
+                           reason: str = "") -> dict:
+        key = song + "|" + blogger
+        app_token = self.client.ensure_bitable()
+        table_id = self.client.ensure_table(app_token, PROMO_TABLE, PROMO_FIELDS)
+        rid, old = self.client.find_record(app_token, table_id, "行键", key)
+        if rid is None:
+            return {"error": "《推广账号表》中没有 " + key + " 的申请记录"}
+        old_status = self.client._to_write_format((old or {}).get("审核状态", "")) or "待审核"
+        fields = {"行键": key, "审核状态": decision}
+        if reason:
+            fields["审核备注"] = reason
+        self.client.upsert_record(app_token, table_id, "行键", key, fields)
+        memory.add_status_change(key, "审核状态", old_status, decision)
+        template = "green" if decision == "已批准" else "red"
+        self.client.send_card(
+            f"【审核结果】{key}",
+            f"「{blogger}」的申请已由管理者**{decision}**"
+            + (f"（原因：{reason}）" if reason else ""),
+            template=template, to_chat_id=self.chat_id)
+        return {"status": "ok", "row_key": key, "review": decision,
+                "previous": old_status}
+
+    def rollback_last_change(self, song: str, blogger: str, field: str = "") -> dict:
+        key = song + "|" + blogger
+        entry = memory.last_status_change(key, field)
+        if not entry:
+            return {"error": "没有找到 " + key + " 可回滚的状态变更记录"}
+        field_name = entry["field"]
+        restore = entry["old"]
+        app_token = self.client.ensure_bitable()
+        table_id = self.client.ensure_table(app_token, PROMO_TABLE, PROMO_FIELDS)
+        self.client.upsert_record(app_token, table_id, "行键", key,
+                                  {"行键": key, field_name: restore})
+        memory.add_status_change(key, field_name, entry["new"],
+                                 f"（回滚自 {entry['ts']}）{restore}")
+        return {"status": "ok", "row_key": key, "field": field_name,
+                "restored": restore, "changed_at": entry["ts"]}
 
 
 def handle_text_wrap(text: str, chat_id: str = "") -> str:

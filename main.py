@@ -158,7 +158,7 @@ def cmd_seed_roster(args):
 def cmd_reset(args):
     """清空两张表的记录 + 重置事件总线/去重缓存/记忆，准备全新测试（表格与字段保留）。"""
     for fname in ("events.jsonl", "processed_events.json", "seen_events.json",
-                  "mock_feishu.json", "memory_chat.json", "memory_ops.json"):
+                  "mock_feishu.json", "memory_chat.json", "memory_ops.json", "status_history.json"):
         p = config.STATE_DIR / fname
         if p.exists():
             p.unlink()

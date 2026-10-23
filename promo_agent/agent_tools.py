@@ -98,6 +98,30 @@ RECENT_APPS = {
     }},
 }
 
+REVIEW_APPLICATION = {
+    "name": "review_application",
+    "description": "【管理者专用】审核一笔申请：更新《推广账号表》的「审核状态」。"
+                   "员工申请入表后为待审核，由管理者回复“同意/驳回 + 达人名”触发本工具。",
+    "parameters": {"type": "object", "properties": {
+        "song": {"type": "string", "description": "歌曲名"},
+        "blogger": {"type": "string", "description": "博主/达人昵称"},
+        "decision": {"type": "string", "enum": ["已批准", "已驳回"],
+                     "description": "审核结论（待审核 之外的二选一）"},
+        "reason": {"type": "string", "description": "驳回/批准原因（可选）"},
+    }, "required": ["song", "blogger", "decision"]},
+}
+ROLLBACK_LAST_CHANGE = {
+    "name": "rollback_last_change",
+    "description": "【管理者专用】回滚某行最近一次状态变更（审核状态/是否接单/是否打款），"
+                   "恢复为变更前的值。适用于“刚才批错了”“状态改错了，撤回”。",
+    "parameters": {"type": "object", "properties": {
+        "song": {"type": "string", "description": "歌曲名"},
+        "blogger": {"type": "string", "description": "博主/达人昵称"},
+        "field": {"type": "string", "enum": ["审核状态", "是否接单", "是否打款"],
+                  "description": "要回滚的字段（可选，不填则回滚该行最近一次任意变更）"},
+    }, "required": ["song", "blogger"]},
+}
+
 SUB_TOOLS = [SUBMIT_APPLICATION, LOOKUP, UPDATE_ORDER, MARK_PAID,
-             RECENT_APPS, SEARCH_KB, ASK_MASTER]
+             REVIEW_APPLICATION, ROLLBACK_LAST_CHANGE, RECENT_APPS, SEARCH_KB, ASK_MASTER]
 MASTER_TOOLS = [SUMMARIZE, QUERY_REPORTS, LOOKUP, SEARCH_KB]

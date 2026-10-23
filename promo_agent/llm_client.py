@@ -6,6 +6,7 @@ Agent 的“大脑”：模型看到工具清单 -> 自己决定调用哪个工�
 -> 直到给出最终自然语言回答。这就是 Agent 与脚本的本质区别：控制流由模型决定。
 """
 import json
+import threading
 import time
 from typing import Callable, List, Optional
 
@@ -15,6 +16,7 @@ from promo_agent import config
 from promo_agent import observability as obs
 
 _HTTP = requests.Session()   # 连接复用，降低每轮调用的握手开销
+_LLM_SEM = threading.Semaphore(max(1, config.MAX_CONCURRENT_LLM))   # 并发上限，防突发限流
 
 
 class LLMError(RuntimeError):
@@ -31,11 +33,12 @@ def chat(messages: List[dict], tools: Optional[list] = None, temperature: float 
         payload["tools"] = [{"type": "function", "function": t} for t in tools]
         payload["tool_choice"] = "auto"
     t0 = time.time()
-    r = _HTTP.post(
-        config.LLM_BASE_URL.rstrip("/") + "/chat/completions",
-        headers={"Authorization": f"Bearer {config.LLM_API_KEY}",
-                 "Content-Type": "application/json"},
-        json=payload, timeout=60)
+    with _LLM_SEM:   # 高并发下限流保护：超过上限的调用排队等待
+        r = _HTTP.post(
+            config.LLM_BASE_URL.rstrip("/") + "/chat/completions",
+            headers={"Authorization": f"Bearer {config.LLM_API_KEY}",
+                     "Content-Type": "application/json"},
+            json=payload, timeout=60)
     try:
         data = r.json()
     except ValueError:

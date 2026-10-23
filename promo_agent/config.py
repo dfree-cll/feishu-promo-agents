@@ -29,6 +29,14 @@ FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", "")
 SUB_AGENT_NAME = "推广助手（Sub-Agent）"
 MASTER_AGENT_NAME = "综合助手（Master-Agent）"
 
+# ---------- 并发配置 ----------
+LISTEN_WORKERS = int(os.getenv("LISTEN_WORKERS", "8"))        # 群消息并发工作线程数
+MAX_CONCURRENT_LLM = int(os.getenv("MAX_CONCURRENT_LLM", "8"))  # LLM 调用并发上限（信号量）
+
+# ---------- 审批配置 ----------
+# 有权执行审核/回滚的发送者 open_id（逗号分隔）；留空 = 不校验（演示环境）
+APPROVER_OPEN_IDS = [x.strip() for x in os.getenv("APPROVER_OPEN_IDS", "").split(",") if x.strip()]
+
 # ---------- LLM（Agent 的大脑；OpenAI 兼容接口均可）----------
 # 例：GLM   https://open.bigmodel.cn/api/paas/v4   模型 glm-4-flash
 # 例：DeepSeek https://api.deepseek.com           模型 deepseek-chat

@@ -15,10 +15,12 @@ from promo_agent import config
 
 CHAT_FILE = config.STATE_DIR / "memory_chat.json"
 OPS_FILE = config.STATE_DIR / "memory_ops.json"
+STATUS_HISTORY_FILE = config.STATE_DIR / "status_history.json"
 _LOCK = threading.Lock()
 
 MAX_TURNS_PER_CHAT = 20
 MAX_OPS = 50
+MAX_STATUS_HISTORY = 200
 
 
 def _now() -> str:
@@ -61,6 +63,31 @@ def clear_chat(chat_id: str):
         store.pop(chat_id or "default", None)
         CHAT_FILE.write_text(json.dumps(store, ensure_ascii=False, indent=1),
                              encoding="utf-8")
+
+
+# ---------------------------------------------------------------- 状态变更历史（回滚依据）
+def add_status_change(row_key: str, field: str, old, new):
+    """记录一次状态字段变更；回滚 = 把 old 写回。"""
+    with _LOCK:
+        hist = _load(STATUS_HISTORY_FILE, [])
+        hist.append({"ts": _now(), "row_key": row_key, "field": field,
+                     "old": old, "new": new})
+        STATUS_HISTORY_FILE.write_text(
+            json.dumps(hist[-MAX_STATUS_HISTORY:], ensure_ascii=False, indent=1),
+            encoding="utf-8")
+
+
+def last_status_change(row_key: str, field: str = "") -> Optional[Dict]:
+    """最近一次该行（可限字段）的状态变更；没有返回 None。"""
+    with _LOCK:
+        hist = _load(STATUS_HISTORY_FILE, [])
+    for entry in reversed(hist):
+        if entry.get("row_key") != row_key:
+            continue
+        if field and entry.get("field") != field:
+            continue
+        return entry
+    return None
 
 
 # ---------------------------------------------------------------- 操作记忆

@@ -45,6 +45,25 @@ def validate_order_args(args: dict) -> dict:
     return {"status": status}
 
 
+REVIEW_DECISIONS = ("已批准", "已驳回")
+REVIEWABLE_FIELDS = ("审核状态", "是否接单", "是否打款")
+
+
+def validate_review_args(args: dict) -> dict:
+    decision = str(args.get("decision") or "").strip()
+    if decision not in REVIEW_DECISIONS:
+        raise ValueError("decision 必须是 已批准/已驳回 之一")
+    return {"decision": decision,
+            "reason": str(args.get("reason") or "").strip()[:100]}
+
+
+def validate_rollback_args(args: dict) -> dict:
+    field = str(args.get("field") or "").strip()
+    if field and field not in REVIEWABLE_FIELDS:
+        raise ValueError("field 必须是 审核状态/是否接单/是否打款 之一")
+    return {"field": field}
+
+
 def validate_paid_args(args: dict, today: str) -> dict:
     return {"paid_date": clean_date(args, "paid_date", today, today)}
 
