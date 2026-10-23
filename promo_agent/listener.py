@@ -9,6 +9,7 @@
 import json
 import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 if sys.platform == "win32":
@@ -105,9 +106,9 @@ def run():
         return (f"\n\n📊 [打开《推广账号表》]({promo_url})"
                 f" ｜ 📈 [打开《综合管理表》]({mgmt_url})")
 
-    def _process(text: str, chat_id: str, sender: str = ""):
+    def _process(text: str, chat_id: str, sender: str = "", msg_time: str = ""):
         try:
-            print(f"\n[监听] 开始处理：{text[:80]}")
+            print(f"\n[监听] 开始处理（提交时间 {msg_time or '未知'}）：{text[:80]}")
 
             from promo_agent.llm_client import llm_ready
             if llm_ready():
@@ -116,15 +117,17 @@ def run():
                 fast_events, _ = parse_any(text)
                 if fast_events:
                     print("[路由] 命中标准格式，走规则快速路径")
-                    sub.ingest_text(text, table_url=table_urls()[0])
+                    sub.ingest_text(text, table_url=table_urls()[0], msg_time=msg_time)
                     master.run()
                     return
-                # Agent 路径：先秒回“处理中”回执卡，完成后原地更新为结果
+                # Agent 路径：先秒回“处理中”回执卡（带提交时间），完成后原地更新为结果
                 ack_id = client.send_card("⏳ 收到，正在处理…",
+                                          f"**提交时间**：{msg_time or '—'}\n"
                                           f"消息：{text[:80]}",
                                           template="grey", to_chat_id=chat_id)
-                reply = sub.handle_text(text, chat_id, sender)
-                markdown = reply + table_footer()
+                reply = sub.handle_text(text, chat_id, sender, msg_time)
+                markdown = (reply + table_footer()
+                            + (f"\n\n🕘 提交时间：{msg_time}" if msg_time else ""))
                 done = False
                 if ack_id:
                     done = client.update_card(ack_id, "【推广助手】回复", markdown,
@@ -134,7 +137,7 @@ def run():
                                      template="blue", to_chat_id=chat_id)
                 return
             # 兜底路径：规则解析（未配置 LLM Key 时）
-            events = sub.ingest_text(text, table_url=table_urls()[0])
+            events = sub.ingest_text(text, table_url=table_urls()[0], msg_time=msg_time)
             if not events:
                 client.send_card("未识别的申请消息", _UNKNOWN_HELP + table_footer(),
                                  template="grey", to_chat_id=chat_id)
@@ -145,6 +148,7 @@ def run():
 
     def on_message(data):
         try:
+            from datetime import datetime as _dt
             from promo_agent import observability as obs
             msg = data.event.message
             ev_key = getattr(getattr(data, "header", None), "event_id", "") \
@@ -158,14 +162,24 @@ def run():
             text = _clean_text(json.loads(msg.content).get("text", ""), names)
             if not text:
                 return
+            # 消息采集时间：优先用飞书事件里的发送时间（防止员工忘写时间）
+            msg_time = ""
+            try:
+                ct = str(getattr(msg, "create_time", "") or "")
+                if ct.isdigit():
+                    msg_time = _dt.fromtimestamp(int(ct) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+            except (TypeError, ValueError, OSError):
+                pass
+            if not msg_time:
+                msg_time = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
             sender = ""
             try:
                 sender = data.event.sender.sender_id.open_id
             except AttributeError:
                 pass
             obs.observe_message()
-            print(f"\n[监听] 收到群消息：{text[:80]}")
-            pool.submit(_process, text, msg.chat_id, sender)   # 并发处理，不阻塞下一条消息
+            print(f"\n[监听] 收到群消息（提交时间 {msg_time}）：{text[:80]}")
+            pool.submit(_process, text, msg.chat_id, sender, msg_time)   # 并发处理，不阻塞下一条消息
         except Exception as e:
             print(f"[监听] 事件分发出错：{e}")
 
@@ -188,6 +202,17 @@ def run():
     print(f"[{config.SUB_AGENT_NAME}] 长连接监听已启动。"
           f"在群里 @机器人 发送申请内容即可触发全链路（Ctrl+C 退出）。")
     try:
-        ws.start()
+        # 断线自愈：ws.start() 正常返回或抛异常都意味着长连接已经断了
+        # （实测会出现 keepalive ping timeout 导致 receive loop exit）。
+        # 常驻服务 + 23:00 日终定时器都挂在本进程里，不能让进程静默退出。
+        while True:
+            try:
+                ws.start()
+                print("[监听] 长连接已断开，5 秒后重连…")
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                print(f"[监听] 长连接异常：{e}；5 秒后重连…")
+            time.sleep(5)
     except KeyboardInterrupt:
         print("\n监听已停止。")

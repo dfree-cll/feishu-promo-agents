@@ -18,7 +18,8 @@ from promo_agent.agent_tools import SUB_TOOLS
 from promo_agent.feishu_client import FeishuClient
 from promo_agent.extractor import parse_any
 from promo_agent.models import ApplicationRecord, SummaryEvent, business_today
-from promo_agent.table_schema import PROMO_TABLE, PROMO_FIELDS, promo_record_fields
+from promo_agent.table_schema import (PROMO_TABLE, PROMO_FIELDS,
+                                      promo_new_row_defaults, promo_record_fields)
 
 EVENT_BUS = config.STATE_DIR / "events.jsonl"      # Sub -> Master 的结构化事件通道
 
@@ -73,9 +74,14 @@ class SubAgent:
         self.client = client or FeishuClient()
 
     # ---------- Agent 路径：LLM 工具循环 ----------
-    def handle_text(self, text: str, chat_id: str = "", sender: str = "") -> str:
-        """任意口语化消息 -> 会话记忆 + LLM 理解 -> 自主调用工具 -> 自然语言回复。"""
+    def handle_text(self, text: str, chat_id: str = "", sender: str = "",
+                    msg_time: str = "") -> str:
+        """任意口语化消息 -> 会话记忆 + LLM 理解 -> 自主调用工具 -> 自然语言回复。
+
+        msg_time：消息采集时间（飞书事件里的发送时间），用于业务日归属与台账留痕。
+        """
         import time as _time
+        from datetime import datetime as _dt
         from promo_agent.llm_client import run_tool_loop, llm_ready
         from promo_agent import memory, observability as obs
         if not llm_ready():
@@ -85,7 +91,11 @@ class SubAgent:
         obs.set_current_run(run_id)
         obs.log_event("agent_run_start", run_id=run_id, message=text[:120], sender=sender)
         t0 = _time.time()
-        biz_day = business_today()
+        try:
+            biz_day = business_today(_dt.fromisoformat(msg_time)) if msg_time \
+                else business_today()
+        except ValueError:
+            biz_day = business_today()
         history = memory.get_recent_turns(chat_id, 6)
         if history:
             obs.log_event("memory_context", run_id=run_id, turns=len(history))
@@ -94,7 +104,8 @@ class SubAgent:
                                "（23:00 后提交的申请计入下一业务日）"}]
         messages += history
         messages.append({"role": "user", "content": text})
-        executor = SubToolExecutor(self).bind(chat_id=chat_id, sender=sender)
+        executor = SubToolExecutor(self).bind(chat_id=chat_id, sender=sender,
+                                              msg_time=msg_time)
         reply = run_tool_loop(
             messages, SUB_TOOLS, executor.run_tool,
             answer_key="answer_text",   # 确认/转交类回复由代码直出，省一轮组稿
@@ -117,7 +128,8 @@ class SubAgent:
               f"(事件总线: {EVENT_BUS.name})")
 
     # ---------- 兜底路径：规则解析（离线/无 LLM 时可用）----------
-    def ingest_text(self, text: str, notify_master: bool = True, table_url: str = "") -> List[SummaryEvent]:
+    def ingest_text(self, text: str, notify_master: bool = True, table_url: str = "",
+                    msg_time: str = "") -> List[SummaryEvent]:
         events, errors = parse_any(text)
         for err in errors:
             print(f"[{self.name}] ⚠️ {err}")
@@ -126,14 +138,24 @@ class SubAgent:
         table_id = self.client.ensure_table(
             app_token, PROMO_TABLE, PROMO_FIELDS)
 
+        today = business_today()
         for ev in events:
+            # 规则路径兜底：总结文本没写日期时按当前业务日归属，
+            # 否则 summary_date 为空会让这些申请永远进不了任何一天的日报。
+            if not ev.summary_date:
+                ev.summary_date = today
+                ev.__post_init__()   # 日期变了 —— 按新内容重算确定性 event_id
             written = 0
             for rec in ev.records:
+                rec.summary_date = rec.summary_date or ev.summary_date
+                if msg_time:
+                    rec.submitted_at = msg_time   # 群消息采集时间落库（提交时间列）
                 fields = promo_record_fields(rec.to_dict())
                 if not config.REVIEW_ENABLED:
                     fields["审核状态"] = "已批准"
                 rid = self.client.upsert_record(
-                    app_token, table_id, "行键", rec.row_key, fields)
+                    app_token, table_id, "行键", rec.row_key, fields,
+                    create_defaults=promo_new_row_defaults(rec.app_type))
                 from promo_agent import memory
                 memory.add_status_change(rec.row_key, "审核状态", "", fields["审核状态"])
                 written += 1
@@ -173,15 +195,21 @@ class SubToolExecutor:
         self.client = agent.client
         self.chat_id = ""
         self.sender = ""
+        self.msg_time = ""
 
-    def bind(self, chat_id: str = "", sender: str = "") -> "SubToolExecutor":
+    def bind(self, chat_id: str = "", sender: str = "", msg_time: str = "") -> "SubToolExecutor":
         self.chat_id = chat_id or self.chat_id
         self.sender = sender or self.sender
+        self.msg_time = msg_time or self.msg_time
         return self
 
     def _require_manager(self) -> Optional[dict]:
-        """审核/回滚属管理者指令：配置了 APPROVER_OPEN_IDS 时校验发送者身份。"""
-        if config.APPROVER_OPEN_IDS and self.sender and self.sender not in config.APPROVER_OPEN_IDS:
+        """审核/回滚属管理者指令：配置了 APPROVER_OPEN_IDS 时校验发送者身份。
+
+        fail-closed：白名单非空但取不到发送者身份（如事件解析失败）时一律拒绝，
+        避免“解析不到 open_id 就放行”导致的越权。白名单留空 = 演示模式，不校验。
+        """
+        if config.APPROVER_OPEN_IDS and (not self.sender or self.sender not in config.APPROVER_OPEN_IDS):
             return {"error": "只有管理者可以执行审核/回滚操作。"}
         return None
 
@@ -189,6 +217,7 @@ class SubToolExecutor:
         from promo_agent import validators as v
         try:
             if tool_name == "submit_application":
+                params = {**params, "submitted_at": self.msg_time}   # 采集时间由系统注入
                 clean = v.validate_submit_args(params, business_today())
                 return self.submit_application(**clean)
             if tool_name == "lookup_promo_table":
@@ -259,7 +288,7 @@ class SubToolExecutor:
         app_token = self.client.ensure_bitable()
         table_id = self.client.ensure_table(app_token, PROMO_TABLE, PROMO_FIELDS)
         rid = self.client.upsert_record(app_token, table_id, "行键",
-                                        rec.row_key, promo_record_fields(rec.to_dict()))
+                                        rec.row_key, promo_record_fields(rec.to_dict()), create_defaults=promo_new_row_defaults(rec.app_type))
         return {"status": "ok", "type": app_type, "row_key": rec.row_key,
                 "amount": rec.amount, "tx_count": rec.tx_count, "record_id": rid}
 
@@ -296,11 +325,11 @@ class SubToolExecutor:
     def submit_application(self, app_type: str, song: str, blogger: str, amount: float,
                            tx_count: int, payer: str, date: str,
                            expected_pay_date: str = "", stated_total: float = 0.0,
-                           stated_count: int = 0) -> dict:
+                           stated_count: int = 0, submitted_at: str = "") -> dict:
         """一笔申请一步完成：写入《推广账号表》+ 结构化事件上报 Master（后台聚合）。"""
         rec = ApplicationRecord(song=song, blogger=blogger, app_type=app_type,
                                 amount=amount, tx_count=tx_count,
-                                summary_date=date, payer=payer,
+                                summary_date=date, payer=payer, submitted_at=submitted_at,
                                 expected_pay_date=expected_pay_date)
         app_token = self.client.ensure_bitable()
         table_id = self.client.ensure_table(app_token, PROMO_TABLE, PROMO_FIELDS)
@@ -308,7 +337,7 @@ class SubToolExecutor:
         review_on = config.REVIEW_ENABLED
         fields["审核状态"] = "待审核" if review_on else "已批准"
         rid = self.client.upsert_record(app_token, table_id, "行键",
-                                        rec.row_key, fields)
+                                        rec.row_key, fields, create_defaults=promo_new_row_defaults(rec.app_type))
         memory.add_status_change(rec.row_key, "审核状态", "", fields["审核状态"])
         label = "抖加" if app_type == "doujia" else "垫付"
         role_label = "支付人" if app_type == "doujia" else "打款人"

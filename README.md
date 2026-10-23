@@ -85,6 +85,14 @@ python -m main seed-roster    # （可选）预置达人名单
 `demo` 会用内置样例数据完整走一遍：解析入表 → 结构化上报 → 聚合写《综合管理表》→
 输出日报。表格与消息同时存档在 `state/` 目录，重复运行不会产生重复数据。
 
+### 测试
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q     # 纯逻辑回归用例：零网络、零飞书凭证
+```
+
+
 ## 接入真实飞书环境
 
 ### 1. 创建自建应用

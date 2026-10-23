@@ -13,11 +13,13 @@ from typing import Optional, List, Dict, Any
 import requests
 
 from promo_agent import config
+from promo_agent import observability as obs
 from promo_agent.table_schema import (BITABLE_NAME, PROMO_TABLE, MGMT_TABLE,
                                       PROMO_FIELDS, MGMT_FIELDS)
 
 TOKEN_CACHE = config.STATE_DIR / "token_cache.json"
 MOCK_STORE = config.STATE_DIR / "mock_feishu.json"
+PAGE_SIZE_MAX = 500   # 飞书多维表格 records/search 单页上限
 
 
 class FeishuError(RuntimeError):
@@ -136,7 +138,7 @@ class FeishuClient:
         try:
             existing = {f["field_name"] for f in self._api(
                 "GET", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
-                params={"page_size": 100}).get("items", [])}
+                params={"page_size": 200}).get("items", [])}
         except FeishuError as e:
             print(f"[警告] 读取表字段失败，跳过字段同步：{e}")
             return
@@ -213,7 +215,7 @@ class FeishuClient:
 
     def search_records(self, app_token: str, table_id: str, field_name: str,
                        value: str) -> List[dict]:
-        """按字段值查多条记录，返回字段字典列表。"""
+        """按字段值查多条记录（自动翻页，直到 has_more 为 False），返回字段字典列表。"""
         if self.mock:
             store = _mock_load()
             records = store["bitables"][app_token]["tables"][table_id]["records"]
@@ -223,12 +225,26 @@ class FeishuClient:
             {"filter": {"conjunction": "and",
                         "conditions": [{"field_name": field_name, "operator": "is",
                                         "value": [value]}]}},
-            params={"page_size": 100})
+            params={"page_size": PAGE_SIZE_MAX})
+        # 自动翻页：飞书单页上限 500 条，超出后必须带 page_token 继续取，
+        # 否则查询结果会被静默截断（会让"精确计算"的总数算少而不报错）。
+        _items = list(data.get("items") or [])
+        _tok = data.get("page_token") or ""
+        while data.get("has_more"):
+            data = self._api(
+                "POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/search",
+                {"filter": {"conjunction": "and",
+                            "conditions": [{"field_name": field_name, "operator": "is",
+                                            "value": [value]}]}},
+                params={"page_size": PAGE_SIZE_MAX, "page_token": _tok})
+            _items += list(data.get("items") or [])
+            _tok = data.get("page_token") or ""
+        data = {"items": _items}
         return [it.get("fields", {}) for it in (data.get("items") or [])]
 
     def search_all_records(self, app_token: str, table_id: str,
-                           page_size: int = 100) -> List[dict]:
-        """拉取表内全部记录（上限 page_size 条）。"""
+                           page_size: int = PAGE_SIZE_MAX) -> List[dict]:
+        """拉取表内全部记录（自动翻页，直到 has_more 为 False）。"""
         if self.mock:
             store = _mock_load()
             records = store["bitables"][app_token]["tables"][table_id]["records"]
@@ -236,6 +252,16 @@ class FeishuClient:
         data = self._api(
             "POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/search",
             {}, params={"page_size": page_size})
+        # 同上：自动翻页，避免只取第一页导致 totals 少算且不告警。
+        _items = list(data.get("items") or [])
+        _tok = data.get("page_token") or ""
+        while data.get("has_more"):
+            data = self._api(
+                "POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/search",
+                {}, params={"page_size": PAGE_SIZE_MAX, "page_token": _tok})
+            _items += list(data.get("items") or [])
+            _tok = data.get("page_token") or ""
+        data = {"items": _items}
         return [it.get("fields", {}) for it in (data.get("items") or [])]
 
     def clear_records(self, app_token: str, table_id: str) -> int:
@@ -274,11 +300,19 @@ class FeishuClient:
         return v
 
     def upsert_record(self, app_token: str, table_id: str, key_field: str,
-                      key_value: str, fields: dict) -> str:
-        """按唯一键 upsert：已存在则「合并字段后整体写回」，避免覆盖另一侧（抖加/垫付）的列。"""
+                      key_value: str, fields: dict,
+                      create_defaults: Optional[dict] = None) -> str:
+        """按唯一键 upsert：已存在则「合并字段后整体写回」，避免覆盖另一侧（抖加/垫付）的列。
+
+        create_defaults：仅在【新建行】时补入的初始值（如 是否接单=已接单、
+        是否打款=待打款）。已存在的行不会被它覆盖，从而保证
+        update_order_status / mark_paid 回写的真实状态不被后续申请冲掉。
+        """
         record_id, old_fields = self.find_record(app_token, table_id, key_field, key_value)
         old_fields = {k: self._to_write_format(v) for k, v in (old_fields or {}).items()}
         merged = {**old_fields, **fields}
+        if record_id is None and create_defaults:
+            merged = {**create_defaults, **merged}
         if self.mock:
             store = _mock_load()
             records = store["bitables"][app_token]["tables"][table_id]["records"]
@@ -403,9 +437,11 @@ class FeishuClient:
                              {"receive_id": dest, "msg_type": "interactive",
                               "content": json.dumps(card, ensure_ascii=False)},
                              params={"receive_id_type": "chat_id"})
+            obs.observe_card()
             return data.get("message_id")
         if config.FEISHU_WEBHOOK_URL:
             self._send_webhook(card)
+            obs.observe_card()
             return None
         print(f"[跳过发送] 未配置 FEISHU_CHAT_ID / FEISHU_WEBHOOK_URL：【{title}】")
         return None

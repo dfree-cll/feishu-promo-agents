@@ -40,6 +40,7 @@ class ApplicationRecord:
     summary_date: str = ""     # 申请汇总日期 2026-09-02
     payer: str = ""            # 抖加：支付人；垫付：打款人
     expected_pay_date: str = ""  # 垫付专用：预计打款日期
+    submitted_at: str = ""       # 消息采集时间（群消息的发送/接收时间）
     source: str = "推广群"
     raw_line: str = ""
 
@@ -64,6 +65,7 @@ class SummaryEvent:
     stated_count: int = 0               # 汇总文本口径的笔数
     payer: str = ""                     # 抖加支付人 / 打款人
     expected_pay_date: str = ""
+    captured_at: str = ""               # 消息采集时间（群消息的发送/接收时间）
     source: str = "推广群"
     event_id: str = ""
     produced_by: str = "sub_agent_promotion"

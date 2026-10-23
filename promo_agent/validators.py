@@ -99,6 +99,7 @@ def validate_submit_args(args: dict, today: str) -> dict:
             raise ValueError("垫付申请不应填写 doujia_payer（支付人），请使用 dianfu_payer（打款人）")
     clean = validate_write_args(merged, today)
     clean["app_type"] = app_type
+    clean["submitted_at"] = str(args.get("submitted_at") or "")[:32]   # 系统注入的采集时间
     clean["stated_total"] = float(args.get("stated_total") or 0)
     clean["stated_count"] = int(args.get("stated_count") or 0)
     return clean
