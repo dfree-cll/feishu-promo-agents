@@ -435,3 +435,88 @@ def test_parse_combined_message_with_separator_still_works():
     df = next(e for e in events if e.event_type == "dianfu_summary")
     assert dj.detail_total == 300 and df.detail_total == 500
     assert dj.warnings == [] and df.warnings == []
+
+# ------------------------------------------------------------------ 重试语义（0.7.7）
+class _FakeResp:
+    def __init__(self, status=200, body=None):
+        self.status_code = status
+        self._body = body if body is not None else {"code": 0, "data": {"ok": True}}
+
+    def json(self):
+        return self._body
+
+
+class _FakeHTTP:
+    """记录调用次数的假 HTTP 会话。"""
+
+    def __init__(self, exc=None, resp=None):
+        self.calls = 0
+        self.exc = exc
+        self.resp = resp or _FakeResp()
+
+    def request(self, *args, **kwargs):
+        self.calls += 1
+        if self.exc:
+            raise self.exc
+        return self.resp
+
+
+def _client_with(fake):
+    c = fc.FeishuClient(mock=True)
+    c._http = fake
+    c._tenant_token = lambda: "fake-token"
+    return c
+
+
+def test_api_write_does_not_retry_on_read_timeout():
+    """写操作读超时：服务端可能已执行，必须只尝试一次（否则重复建记录/重复发卡片）。"""
+    import requests
+
+    fake = _FakeHTTP(exc=requests.Timeout("read timed out"))
+    c = _client_with(fake)
+    with pytest.raises(fc.FeishuError):
+        c._api("POST", "/open-apis/im/v1/messages", {"x": 1})
+    assert fake.calls == 1
+
+
+def test_api_read_retries_on_timeout(monkeypatch):
+    """读操作无副作用，超时应重试满 3 次。"""
+    import requests
+
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    fake = _FakeHTTP(exc=requests.Timeout("read timed out"))
+    c = _client_with(fake)
+    with pytest.raises(fc.FeishuError):
+        c._api("GET", "/open-apis/bitable/v1/apps/x/tables")
+    assert fake.calls == 3
+
+
+def test_api_write_retries_on_connection_error(monkeypatch):
+    """连接失败说明请求没送达，写操作可安全重试。"""
+    import requests
+
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    fake = _FakeHTTP(exc=requests.ConnectionError("connection refused"))
+    c = _client_with(fake)
+    with pytest.raises(fc.FeishuError):
+        c._api("POST", "/open-apis/bitable/v1/apps", {})
+    assert fake.calls == 3
+
+
+def test_api_write_does_not_retry_on_5xx():
+    """写操作遇 5xx：可能已执行，不自动重试。"""
+    fake = _FakeHTTP(resp=_FakeResp(status=500, body={"code": 1254005, "msg": "internal"}))
+    c = _client_with(fake)
+    with pytest.raises(fc.FeishuError):
+        c._api("PUT", "/open-apis/bitable/v1/x", {"fields": {}})
+    assert fake.calls == 1
+
+
+def test_api_rate_limit_retries_even_for_write(monkeypatch):
+    """限流是服务端明确拒绝（未执行），写操作也可以安全重试。"""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    fake = _FakeHTTP(resp=_FakeResp(status=200, body={"code": 99991400, "msg": "rate limit"}))
+    c = _client_with(fake)
+    with pytest.raises(fc.FeishuError):
+        c._api("POST", "/open-apis/im/v1/messages", {})
+    assert fake.calls == 3

@@ -69,31 +69,75 @@ class FeishuClient:
             {"token": self._token, "expire_at": self._token_expire_at}), encoding="utf-8")
         return self._token
 
+    # 写方法：飞书的写接口没有幂等键，重复执行会产生重复记录/重复消息
+    _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+    # 限流错误码：服务端明确拒绝、未执行任何副作用 → 重试是安全的
+    _RATE_LIMIT_CODES = (99991400, 99991401)
+    _MAX_ATTEMPTS = 3
+
     def _api(self, method: str, path: str, payload: Optional[dict] = None,
              params: Optional[dict] = None) -> dict:
-        """带重试的 API 调用：网络超时/连接错误/限流时按 1s/2s/4s 退避重试。"""
+        """带重试的 API 调用（按方法区分重试语义）。
+
+        重试安全性：
+        - **读（GET）**：任何网络错误/5xx/限流都重试（无副作用）。
+        - **写（POST/PUT/DELETE）**：飞书开放平台写接口没有幂等键，
+          一次超时或 5xx 很可能"服务端已经执行、只是响应丢了"——
+          盲目重试会造成重复建记录、群里重复推送卡片。
+          因此写操作只在①连接建立失败（请求肯定没送达）②限流（明确未执行）时重试；
+          读超时 / 5xx 直接报错，由调用方决定是否人工核对。
+        """
+        method_u = str(method).upper()
+        is_write = method_u in self._WRITE_METHODS
         last_err = None
-        for attempt in range(3):
+        for attempt in range(self._MAX_ATTEMPTS):
             try:
                 r = self._http.request(
-                    method, f"{config.FEISHU_BASE_URL}{path}",
+                    method_u, f"{config.FEISHU_BASE_URL}{path}",
                     headers={"Authorization": f"Bearer {self._tenant_token()}",
                              "Content-Type": "application/json; charset=utf-8"},
                     json=payload, params=params, timeout=30)
-            except requests.RequestException as e:   # 超时/连接失败：退避重试
+            except requests.Timeout as e:
+                # 读超时：请求可能已被服务端处理 → 写操作不能重试
+                if is_write:
+                    raise FeishuError(
+                        f"{method_u} {path} 读超时：写操作可能已在服务端执行，"
+                        f"为避免重复副作用不再重试（{e}）")
                 last_err = e
-                time.sleep(2 ** attempt)
-                continue
+                if attempt < self._MAX_ATTEMPTS - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                break
+            except requests.RequestException as e:
+                # 连接失败：请求没有送达服务端，写操作也可以安全重试
+                last_err = e
+                if attempt < self._MAX_ATTEMPTS - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                break
+
             data = r.json()
             if data.get("code") == 0:
                 return data.get("data", {})
-            last_err = FeishuError(f"{method} {path} 失败：{data}")
-            # 限流/服务端错误才重试，参数类错误直接抛出
-            if data.get("code") in (99991400, 99991401) or r.status_code >= 500:
-                time.sleep(2 ** attempt)
-                continue
-            raise last_err
-        raise FeishuError(f"{method} {path} 重试 3 次仍失败：{last_err}")
+
+            last_err = FeishuError(f"{method_u} {path} 失败：{data}")
+            code = data.get("code")
+            if code in self._RATE_LIMIT_CODES:      # 限流：未执行，安全重试
+                if attempt < self._MAX_ATTEMPTS - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                break
+            if r.status_code >= 500:
+                if is_write:
+                    raise FeishuError(
+                        f"{method_u} {path} 服务端 {r.status_code}：写操作可能已执行，"
+                        f"不自动重试（{data}）")
+                if attempt < self._MAX_ATTEMPTS - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                break
+            raise last_err      # 参数/权限类错误：直接抛出
+        raise FeishuError(f"{method_u} {path} 重试 {self._MAX_ATTEMPTS} 次仍失败：{last_err}")
 
     # ================================================== 多维表格
     def ensure_bitable(self) -> str:
