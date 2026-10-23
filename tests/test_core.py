@@ -349,3 +349,39 @@ def test_obs_runs_rotated_when_too_large(monkeypatch, tmp_path):
     archives = list(tmp_path.glob("obs_runs-*.jsonl"))
     assert archives, "超过阈值后应产生归档文件"
     assert runs.exists() and runs.stat().st_size <= 2 * 300
+
+# ------------------------------------------------------------------ 台账累加（0.7.5）
+def test_upsert_accumulates_amount_columns(monkeypatch):
+    """同一博主的多次申请必须累加到同一行（台账是博主粒度总账），不能被后一笔覆盖。"""
+    store = {"bitables": {}, "messages": []}
+    monkeypatch.setattr(fc, "_mock_load", lambda: store)
+    monkeypatch.setattr(fc, "_mock_save", lambda s: None)
+
+    c = fc.FeishuClient(mock=True)
+    app = c.ensure_bitable()
+    tid = c.ensure_table(app, "推广账号表", [])
+    doujia = ("抖加金额", "抖加笔数")
+
+    rid = c.upsert_record(app, tid, "行键", "歌A|初秋",
+                          {"行键": "歌A|初秋", "抖加金额": 300, "抖加笔数": 3},
+                          additive_fields=doujia)
+    c.upsert_record(app, tid, "行键", "歌A|初秋",
+                    {"行键": "歌A|初秋", "抖加金额": 200, "抖加笔数": 2},
+                    additive_fields=doujia)
+
+    rec = store["bitables"][app]["tables"][tid]["records"][rid]
+    assert rec["抖加金额"] == 500          # 300 + 200，不能被覆盖成 200
+    assert rec["抖加笔数"] == 5
+
+    # 垫付列写同一行：两块金额互不影响（抖加仍 500）
+    c.upsert_record(app, tid, "行键", "歌A|初秋",
+                    {"行键": "歌A|初秋", "垫付金额": 950, "垫付笔数": 1},
+                    additive_fields=("垫付金额", "垫付笔数"))
+    rec = store["bitables"][app]["tables"][tid]["records"][rid]
+    assert rec["抖加金额"] == 500 and rec["垫付金额"] == 950
+
+    # 主档字段（报价）不属于累加列，仍是覆盖语义
+    c.upsert_record(app, tid, "行键", "歌A|初秋", {"行键": "歌A|初秋", "报价": 400})
+    c.upsert_record(app, tid, "行键", "歌A|初秋", {"行键": "歌A|初秋", "报价": 450})
+    rec = store["bitables"][app]["tables"][tid]["records"][rid]
+    assert rec["报价"] == 450

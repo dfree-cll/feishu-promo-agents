@@ -109,6 +109,18 @@ def promo_record_fields(rec_dict: dict) -> dict:
 PROMO_NEW_ROW_DEFAULTS = {"是否接单": "待确认", "是否打款": "待打款"}
 
 
+def additive_amount_fields(app_type: str) -> tuple:
+    """需要「累加」而不是「覆盖」的列。
+
+    台账行键是 歌曲|博主（物料《推广账号表》就是博主粒度总账），同一博主的多次
+    申请必须累计到同一行；原实现是整值覆盖，后一笔会把前一笔的金额冲掉
+    （实测：同博主同日两笔抖加 300 + 200，台账只剩 200，而日报是 500）。
+    """
+    if app_type == "doujia":
+        return ("抖加金额", "抖加笔数")
+    return ("垫付金额", "垫付笔数")
+
+
 def promo_new_row_defaults(app_type: str) -> dict:
     """新建行的初始执行态：接单「待确认」；只有垫付申请才涉及「打款」。"""
     defaults = {"是否接单": "待确认"}

@@ -301,7 +301,8 @@ class FeishuClient:
 
     def upsert_record(self, app_token: str, table_id: str, key_field: str,
                       key_value: str, fields: dict,
-                      create_defaults: Optional[dict] = None) -> str:
+                      create_defaults: Optional[dict] = None,
+                      additive_fields: tuple = ()) -> str:
         """按唯一键 upsert：已存在则「合并字段后整体写回」，避免覆盖另一侧（抖加/垫付）的列。
 
         create_defaults：仅在【新建行】时补入的初始值（如 是否接单=已接单、
@@ -311,6 +312,17 @@ class FeishuClient:
         record_id, old_fields = self.find_record(app_token, table_id, key_field, key_value)
         old_fields = {k: self._to_write_format(v) for k, v in (old_fields or {}).items()}
         merged = {**old_fields, **fields}
+        # 累加列（金额/笔数）：仅对【已存在的行】做旧值 + 新值，
+        # 保证同一博主的多次申请累计而非覆盖；非累加列仍是覆盖语义。
+        if record_id is not None:
+            for fname in additive_fields:
+                if fname not in fields:
+                    continue
+                try:
+                    prev = float(old_fields.get(fname) or 0)
+                    merged[fname] = round(prev + float(fields[fname]), 2)
+                except (TypeError, ValueError):
+                    pass          # 旧值不是数字（空串 / 文本）→ 保留本次值
         if record_id is None and create_defaults:
             merged = {**create_defaults, **merged}
         if self.mock:

@@ -142,8 +142,8 @@ def cmd_seed_roster(args):
     c = FeishuClient()
     app = c.ensure_bitable()
     tid = c.ensure_table(app, PROMO_TABLE, PROMO_FIELDS)
+    song = getattr(args, "song", "") or "你是我的仰望"
     for item in roster:
-        song = "你是我的仰望"
         key = f"{song}|{item['博主名']}"
         fields = {
             "行键": key, "歌曲名": song,
@@ -261,7 +261,10 @@ def main():
     sub.add_parser("listen", help="监听群消息（@机器人 实时触发）").set_defaults(func=cmd_listen)
     sub.add_parser("schedule", help="常驻定时（每天23:00）").set_defaults(func=cmd_schedule)
     sub.add_parser("entrance", help="发送表格入口卡片（可置顶）").set_defaults(func=cmd_entrance)
-    sub.add_parser("seed-roster", help="预置物料达人名单").set_defaults(func=cmd_seed_roster)
+    p = sub.add_parser("seed-roster", help="预置物料达人名单（可用 --song 指定归属歌曲）")
+    p.add_argument("--song", default="你是我的仰望",
+                   help="达人名单归属的歌曲名（默认：你是我的仰望）")
+    p.set_defaults(func=cmd_seed_roster)
     sub.add_parser("rebuild", help="从事件总线全量重算日报").set_defaults(func=cmd_rebuild)
     sub.add_parser("reset", help="清空表格记录与事件状态（全新测试）").set_defaults(func=cmd_reset)
     sub.add_parser("setup", help="真实模式一键建表").set_defaults(func=cmd_setup)

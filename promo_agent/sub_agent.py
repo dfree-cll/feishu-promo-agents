@@ -19,6 +19,7 @@ from promo_agent.feishu_client import FeishuClient
 from promo_agent.extractor import parse_any
 from promo_agent.models import ApplicationRecord, SummaryEvent, business_today
 from promo_agent.table_schema import (PROMO_TABLE, PROMO_FIELDS,
+                                      additive_amount_fields,
                                       promo_new_row_defaults, promo_record_fields)
 
 EVENT_BUS = config.STATE_DIR / "events.jsonl"      # Sub -> Master 的结构化事件通道
@@ -175,7 +176,8 @@ class SubAgent:
                     fields["审核状态"] = "已批准"
                 rid = self.client.upsert_record(
                     app_token, table_id, "行键", rec.row_key, fields,
-                    create_defaults=promo_new_row_defaults(rec.app_type))
+                    create_defaults=promo_new_row_defaults(rec.app_type),
+                    additive_fields=additive_amount_fields(rec.app_type))
                 from promo_agent import memory
                 memory.add_status_change(rec.row_key, "审核状态", "", fields["审核状态"])
                 written += 1
@@ -308,7 +310,9 @@ class SubToolExecutor:
         app_token = self.client.ensure_bitable()
         table_id = self.client.ensure_table(app_token, PROMO_TABLE, PROMO_FIELDS)
         rid = self.client.upsert_record(app_token, table_id, "行键",
-                                        rec.row_key, promo_record_fields(rec.to_dict()), create_defaults=promo_new_row_defaults(rec.app_type))
+                                        rec.row_key, promo_record_fields(rec.to_dict()),
+                                        create_defaults=promo_new_row_defaults(rec.app_type),
+                                        additive_fields=additive_amount_fields(rec.app_type))
         return {"status": "ok", "type": app_type, "row_key": rec.row_key,
                 "amount": rec.amount, "tx_count": rec.tx_count, "record_id": rid}
 
@@ -357,7 +361,9 @@ class SubToolExecutor:
         review_on = config.REVIEW_ENABLED
         fields["审核状态"] = "待审核" if review_on else "已批准"
         rid = self.client.upsert_record(app_token, table_id, "行键",
-                                        rec.row_key, fields, create_defaults=promo_new_row_defaults(rec.app_type))
+                                        rec.row_key, fields,
+                                        create_defaults=promo_new_row_defaults(rec.app_type),
+                                        additive_fields=additive_amount_fields(rec.app_type))
         memory.add_status_change(rec.row_key, "审核状态", "", fields["审核状态"])
         label = "抖加" if app_type == "doujia" else "垫付"
         role_label = "支付人" if app_type == "doujia" else "打款人"
