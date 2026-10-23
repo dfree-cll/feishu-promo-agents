@@ -10,6 +10,9 @@
 
 每天 23:00 自动完成当日终版汇总。提供零配置的离线模拟模式，克隆即可体验全流程。
 
+> ⚠️ **本仓库数据已脱敏**：`data/roster.json` 与 `data/samples/` 中的达人昵称、抖音号、
+> 歌曲名均为示例值；金额与「三处口径矛盾」结构原样保留，克隆后可直接跑通演示。
+
 > 当前版本 **v0.7.9**（变更记录见 `CHANGELOG.md`）｜ 35 个离线回归用例 ｜ 已在真实飞书环境
 > 完成端到端验证（群消息 → 写表 → 事件上报 → 聚合日报 → 自然语言问账）。
 
@@ -192,7 +195,7 @@ python -m main listen      # 常驻进程：@机器人 消息实时触发 + 每�
 | `python -m main summary [--date YYYY-MM-DD]` | 手动执行日终总结（默认当前业务日；`--date` 可重算历史某天，**演示物料时必用**） |
 | `python -m main ingest --file <file> \| --text "<文本>"` | 摄入申请总结文本 |
 | `python -m main entrance` | 重发"表格入口"卡片 |
-| `python -m main seed-roster [--song "歌名"]` | 预置达人名单（幂等；`--song` 指定名单归属歌曲，默认《你是我的仰望》） |
+| `python -m main seed-roster [--song "歌名"]` | 预置达人名单（幂等；`--song` 指定名单归属歌曲，默认《示例歌曲》） |
 | `python -m main rebuild` | 从事件总线全量重算日报 |
 | `python -m main reset` | 清空表格记录与事件状态 |
 | `python -m main metrics` | 查看可观测指标（消息/LLM/工具/错误率） |

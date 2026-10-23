@@ -42,7 +42,7 @@ def test_parse_doujia_sample_counts_and_totals():
 def test_parse_warns_on_total_mismatch():
     text = (
         "【抖加金额统计】今日已支付：¥999（2026-09-02）\n\n"
-        "歌名：《你是我的仰望》- 博主名：初秋 - 金额：¥300\n"
+        "歌名：《示例歌曲》- 博主名：示例达人01 - 金额：¥300\n"
     )
     ev = parse_summary(text)
     assert any("金额口径不一致" in w for w in ev.warnings)
@@ -53,7 +53,7 @@ def test_event_id_is_deterministic_and_content_addressed():
     def make(amount: float) -> SummaryEvent:
         return SummaryEvent(
             event_type="doujia_summary", summary_date="2026-09-02", payer="爆火音乐",
-            records=[ApplicationRecord(song="你是我的仰望", blogger="初秋",
+            records=[ApplicationRecord(song="示例歌曲", blogger="示例达人01",
                                        app_type="doujia", amount=amount, tx_count=1)],
         )
 
@@ -72,7 +72,7 @@ def test_ingest_text_accepts_msg_time():
 def test_submit_application_accepts_all_validator_output():
     """validators 产出的每个键，工具实现都必须能接住（否则 TypeError 被吞成模型重试）。"""
     clean = v.validate_submit_args(
-        {"app_type": "doujia", "song": "你是我的仰望", "blogger": "初秋",
+        {"app_type": "doujia", "song": "示例歌曲", "blogger": "示例达人01",
          "amount": 300, "doujia_payer": "爆火音乐"},
         "2026-09-02",
     )
@@ -87,7 +87,7 @@ def test_submit_application_accepts_all_validator_output():
 def test_promo_record_fields_does_not_write_execution_state():
     """是否接单/是否打款 属执行态字段，不能由申请写入覆盖。"""
     fields = promo_record_fields({
-        "row_key": "你是我的仰望|初秋", "song": "你是我的仰望", "blogger": "初秋",
+        "row_key": "示例歌曲|示例达人01", "song": "示例歌曲", "blogger": "示例达人01",
         "app_type": "doujia", "amount": 300, "tx_count": 3, "payer": "爆火音乐",
         "summary_date": "2026-09-02", "submitted_at": "2026-09-02 10:00:00",
         "expected_pay_date": "", "source": "推广群",
@@ -113,16 +113,16 @@ def test_upsert_defaults_only_apply_on_create(monkeypatch):
     tid = c.ensure_table(app, "推广账号表", [])
     defaults = {"是否接单": "已接单", "是否打款": "待打款"}
 
-    rid = c.upsert_record(app, tid, "行键", "A|初秋",
-                          {"行键": "A|初秋", "抖加金额": 100}, create_defaults=defaults)
+    rid = c.upsert_record(app, tid, "行键", "A|示例达人01",
+                          {"行键": "A|示例达人01", "抖加金额": 100}, create_defaults=defaults)
     records = store["bitables"][app]["tables"][tid]["records"]
     assert records[rid]["是否接单"] == "已接单"       # 新建：补默认值
 
     # 达人反馈拒接 -> 回写真实状态
-    c.upsert_record(app, tid, "行键", "A|初秋", {"行键": "A|初秋", "是否接单": "已拒绝"})
+    c.upsert_record(app, tid, "行键", "A|示例达人01", {"行键": "A|示例达人01", "是否接单": "已拒绝"})
     # 之后又有新申请写入同一行
-    c.upsert_record(app, tid, "行键", "A|初秋",
-                    {"行键": "A|初秋", "抖加金额": 200}, create_defaults=defaults)
+    c.upsert_record(app, tid, "行键", "A|示例达人01",
+                    {"行键": "A|示例达人01", "抖加金额": 200}, create_defaults=defaults)
     assert records[rid]["是否接单"] == "已拒绝"       # 关键：不能被冲回已接单
     assert records[rid]["抖加金额"] == 200
 
@@ -138,8 +138,8 @@ def test_aggregate_splits_multi_song_event():
         "event_type": "doujia_summary", "summary_date": "2026-09-02",
         "payer": "爆火音乐",
         "records": [
-            {"song": "歌A", "blogger": "初秋", "amount": 100, "tx_count": 1},
-            {"song": "歌B", "blogger": "艳红", "amount": 200, "tx_count": 2},
+            {"song": "歌A", "blogger": "示例达人01", "amount": 100, "tx_count": 1},
+            {"song": "歌B", "blogger": "示例达人02", "amount": 200, "tx_count": 2},
         ],
     }]
     grouped = _agent().aggregate(events)
@@ -362,11 +362,11 @@ def test_upsert_accumulates_amount_columns(monkeypatch):
     tid = c.ensure_table(app, "推广账号表", [])
     doujia = ("抖加金额", "抖加笔数")
 
-    rid = c.upsert_record(app, tid, "行键", "歌A|初秋",
-                          {"行键": "歌A|初秋", "抖加金额": 300, "抖加笔数": 3},
+    rid = c.upsert_record(app, tid, "行键", "歌A|示例达人01",
+                          {"行键": "歌A|示例达人01", "抖加金额": 300, "抖加笔数": 3},
                           additive_fields=doujia)
-    c.upsert_record(app, tid, "行键", "歌A|初秋",
-                    {"行键": "歌A|初秋", "抖加金额": 200, "抖加笔数": 2},
+    c.upsert_record(app, tid, "行键", "歌A|示例达人01",
+                    {"行键": "歌A|示例达人01", "抖加金额": 200, "抖加笔数": 2},
                     additive_fields=doujia)
 
     rec = store["bitables"][app]["tables"][tid]["records"][rid]
@@ -374,15 +374,15 @@ def test_upsert_accumulates_amount_columns(monkeypatch):
     assert rec["抖加笔数"] == 5
 
     # 垫付列写同一行：两块金额互不影响（抖加仍 500）
-    c.upsert_record(app, tid, "行键", "歌A|初秋",
-                    {"行键": "歌A|初秋", "垫付金额": 950, "垫付笔数": 1},
+    c.upsert_record(app, tid, "行键", "歌A|示例达人01",
+                    {"行键": "歌A|示例达人01", "垫付金额": 950, "垫付笔数": 1},
                     additive_fields=("垫付金额", "垫付笔数"))
     rec = store["bitables"][app]["tables"][tid]["records"][rid]
     assert rec["抖加金额"] == 500 and rec["垫付金额"] == 950
 
     # 主档字段（报价）不属于累加列，仍是覆盖语义
-    c.upsert_record(app, tid, "行键", "歌A|初秋", {"行键": "歌A|初秋", "报价": 400})
-    c.upsert_record(app, tid, "行键", "歌A|初秋", {"行键": "歌A|初秋", "报价": 450})
+    c.upsert_record(app, tid, "行键", "歌A|示例达人01", {"行键": "歌A|示例达人01", "报价": 400})
+    c.upsert_record(app, tid, "行键", "歌A|示例达人01", {"行键": "歌A|示例达人01", "报价": 450})
     rec = store["bitables"][app]["tables"][tid]["records"][rid]
     assert rec["报价"] == 450
 
@@ -391,13 +391,13 @@ def test_parse_combined_message_without_separator():
     """抖加段 + 垫付段直接连写（无 --- 分隔）也要各自识别，且不产生跨类型假告警。"""
     text = (
         "【抖加金额统计】今日已支付：¥1500（2026-10-25）\n\n"
-        "歌名：《合并测试》 - 博主名：初秋 - 金额：¥800（分 2 笔）\n"
-        "歌名：《合并测试》 - 博主名：艳红 - 金额：¥700（分 1 笔）\n\n"
+        "歌名：《合并测试》 - 博主名：示例达人01 - 金额：¥800（分 2 笔）\n"
+        "歌名：《合并测试》 - 博主名：示例达人02 - 金额：¥700（分 1 笔）\n\n"
         "抖加支付人：爆火音乐\n\n"
         "【垫付统计】今日已垫付：¥1200（2026-10-25）\n\n"
         "明细如下：\n"
-        "申请为【达人：初秋】垫付 ¥1000（歌曲《合并测试》）\n"
-        "申请为【达人：艳红】垫付 ¥200（歌曲《合并测试》）\n\n"
+        "申请为【达人：示例达人01】垫付 ¥1000（歌曲《合并测试》）\n"
+        "申请为【达人：示例达人02】垫付 ¥200（歌曲《合并测试》）\n\n"
         "今日共 2 笔垫付申请。\n\n"
         "打款人：林老师\n"
         "预计打款日期：26/10/27"
@@ -420,11 +420,11 @@ def test_parse_combined_message_with_separator_still_works():
     """带 --- 分隔的老写法不能因为这次改造而回归。"""
     text = (
         "【抖加金额统计】今日已支付：¥300（2026-10-26）\n"
-        "歌名：《A》 - 博主名：初秋 - 金额：¥300（分 1 笔）\n"
+        "歌名：《A》 - 博主名：示例达人01 - 金额：¥300（分 1 笔）\n"
         "抖加支付人：爆火音乐\n"
         "---\n"
         "【垫付统计】今日已垫付：¥500（2026-10-26）\n"
-        "申请为【达人：艳红】垫付 ¥500（歌曲《A》）\n"
+        "申请为【达人：示例达人02】垫付 ¥500（歌曲《A》）\n"
         "打款人：林老师"
     )
     events, errors = parse_any(text)
@@ -525,7 +525,7 @@ def test_api_rate_limit_retries_even_for_write(monkeypatch):
 def test_event_id_uses_message_id_when_available():
     """同一条消息重推 → 同 event_id；两条消息发同样文本 → 不同 event_id（都要算）。"""
     text = ("【抖加金额统计】今日已支付：¥300（2026-10-27）\n"
-            "歌名：《幂等测试》 - 博主名：初秋 - 金额：¥300（分 1 笔）\n"
+            "歌名：《幂等测试》 - 博主名：示例达人01 - 金额：¥300（分 1 笔）\n"
             "抖加支付人：爆火音乐")
 
     e1, _ = parse_any(text, message_id="om_msg_A")
@@ -539,7 +539,7 @@ def test_event_id_uses_message_id_when_available():
 def test_event_id_falls_back_to_content_hash_without_message_id():
     """无消息上下文（CLI ingest / 单测）仍按内容哈希，保持旧行为。"""
     text = ("【垫付统计】今日已垫付：¥500（2026-10-27）\n"
-            "申请为【达人：艳红】垫付 ¥500（歌曲《X》）\n"
+            "申请为【达人：示例达人02】垫付 ¥500（歌曲《X》）\n"
             "打款人：林老师")
     a, _ = parse_any(text)
     b, _ = parse_any(text)
@@ -604,7 +604,7 @@ def test_nonretryable_write_error_stops_tool_loop(monkeypatch):
 def test_expected_pay_date_before_summary_date_warns():
     """物料第三个坑：预计打款日期早于申请日期（钱还没申请就先"预计打款"）要告警。"""
     text = ("【垫付统计】今日已垫付：¥950（2026-09-03）\n"
-            "申请为【达人：初秋】垫付 ¥950（歌曲《你是我的仰望》）\n"
+            "申请为【达人：示例达人01】垫付 ¥950（歌曲《示例歌曲》）\n"
             "打款人：林老师\n"
             "预计打款日期：26/08/31")
     ev = parse_summary(text)
@@ -615,7 +615,7 @@ def test_expected_pay_date_before_summary_date_warns():
 def test_expected_pay_date_after_summary_date_is_silent():
     """预计打款日期晚于申请日期是正常业务，不应告警。"""
     text = ("【垫付统计】今日已垫付：¥950（2026-09-03）\n"
-            "申请为【达人：初秋】垫付 ¥950（歌曲《A》）\n"
+            "申请为【达人：示例达人01】垫付 ¥950（歌曲《A》）\n"
             "打款人：林老师\n"
             "预计打款日期：26/09/10")
     ev = parse_summary(text)

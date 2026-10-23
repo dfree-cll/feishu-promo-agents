@@ -62,9 +62,9 @@ def cmd_agent_demo(args):
                  "（支持 GLM / DeepSeek / Kimi 等 OpenAI 兼容服务）。")
     from promo_agent.sub_agent import handle_text_wrap
     samples = [
-        "给《你是我的仰望》找的「山里的孩子」上260抖加，分2笔，走爆火音乐",
-        "垫付申请：达人「葵花夫妇」500块，歌曲《你是我的仰望》，林老师打款，预计2026-10-25",
-        "《你是我的仰望》现在总共花了多少钱？达人接单情况怎么样？",
+        "给《示例歌曲》找的「示例达人15」上260抖加，分2笔，走爆火音乐",
+        "垫付申请：达人「示例达人06」500块，歌曲《示例歌曲》，林老师打款，预计2026-10-25",
+        "《示例歌曲》现在总共花了多少钱？达人接单情况怎么样？",
     ]
     for s in samples:
         print("\n" + "=" * 62)
@@ -144,7 +144,7 @@ def cmd_seed_roster(args):
     c = FeishuClient()
     app = c.ensure_bitable()
     tid = c.ensure_table(app, PROMO_TABLE, PROMO_FIELDS)
-    song = getattr(args, "song", "") or "你是我的仰望"
+    song = getattr(args, "song", "") or "示例歌曲"
     for item in roster:
         key = f"{song}|{item['博主名']}"
         fields = {
@@ -268,8 +268,8 @@ def main():
     sub.add_parser("schedule", help="常驻定时（每天23:00）").set_defaults(func=cmd_schedule)
     sub.add_parser("entrance", help="发送表格入口卡片（可置顶）").set_defaults(func=cmd_entrance)
     p = sub.add_parser("seed-roster", help="预置物料达人名单（可用 --song 指定归属歌曲）")
-    p.add_argument("--song", default="你是我的仰望",
-                   help="达人名单归属的歌曲名（默认：你是我的仰望）")
+    p.add_argument("--song", default="示例歌曲",
+                   help="达人名单归属的歌曲名（默认：示例歌曲）")
     p.set_defaults(func=cmd_seed_roster)
     sub.add_parser("rebuild", help="从事件总线全量重算日报").set_defaults(func=cmd_rebuild)
     sub.add_parser("reset", help="清空表格记录与事件状态（全新测试）").set_defaults(func=cmd_reset)
