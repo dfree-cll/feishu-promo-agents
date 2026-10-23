@@ -131,10 +131,12 @@ class SubAgent:
             written = 0
             for rec in ev.records:
                 fields = promo_record_fields(rec.to_dict())
+                if not config.REVIEW_ENABLED:
+                    fields["审核状态"] = "已批准"
                 rid = self.client.upsert_record(
                     app_token, table_id, "行键", rec.row_key, fields)
                 from promo_agent import memory
-                memory.add_status_change(rec.row_key, "审核状态", "", "待审核")
+                memory.add_status_change(rec.row_key, "审核状态", "", fields["审核状态"])
                 written += 1
                 print(f"[{self.name}] ✅ 已写入《推广账号表》 {rec.blogger} "
                       f"({rec.amount:g}元/{rec.tx_count}笔) -> {rid}")
@@ -304,10 +306,11 @@ class SubToolExecutor:
         app_token = self.client.ensure_bitable()
         table_id = self.client.ensure_table(app_token, PROMO_TABLE, PROMO_FIELDS)
         fields = promo_record_fields(rec.to_dict())
-        fields["审核状态"] = "待审核"
+        review_on = config.REVIEW_ENABLED
+        fields["审核状态"] = "待审核" if review_on else "已批准"
         rid = self.client.upsert_record(app_token, table_id, "行键",
                                         rec.row_key, fields)
-        memory.add_status_change(rec.row_key, "审核状态", "", "待审核")
+        memory.add_status_change(rec.row_key, "审核状态", "", fields["审核状态"])
         label = "抖加" if app_type == "doujia" else "垫付"
         role_label = "支付人" if app_type == "doujia" else "打款人"
         ev = SummaryEvent(
@@ -317,26 +320,29 @@ class SubToolExecutor:
         )
         self.agent.notify_master(ev)
         _run_master_async(self.client)   # 聚合/日报转后台，不阻塞回复
-        # 审批请求卡：提醒管理者处理
-        self.client.send_card(
-            f"🔔 待审核：{label}申请「{blogger}」",
-            f"**歌曲**：《{song}》　**博主**：{blogger}\n"
-            f"**金额**：¥{amount:g}（{tx_count} 笔）　**{role_label}**：{payer}\n"
-            + (f"**预计打款日期**：{expected_pay_date}\n" if expected_pay_date else "")
-            + "\n管理者请回复：**同意 " + blogger + "** 或 **驳回 " + blogger + " [原因]**",
-            template="yellow", to_chat_id=self.chat_id)
+        # 审批请求卡：仅人工审核流开启时发送
+        if review_on:
+            self.client.send_card(
+                f"🔔 待审核：{label}申请「{blogger}」",
+                f"**歌曲**：《{song}》　**博主**：{blogger}\n"
+                f"**金额**：¥{amount:g}（{tx_count} 笔）　**{role_label}**：{payer}\n"
+                + (f"**预计打款日期**：{expected_pay_date}\n" if expected_pay_date else "")
+                + "\n管理者请回复：**同意 " + blogger + "** 或 **驳回 " + blogger + " [原因]**",
+                template="yellow", to_chat_id=self.chat_id)
         # 写入操作记忆：支持“刚才那笔”类召回与后续修改
         memory.add_application({
             "song": song, "blogger": blogger, "app_type": app_type,
             "amount": amount, "tx_count": tx_count, "payer": payer,
             "date": date, "record_id": rid,
         })
-        return {"status": "ok", "review": "待审核", "type": app_type,
+        review_note = ("申请已进入待审核状态，等管理者确认后正式生效。"
+                       if review_on else "申请已直接生效（人工审核流已关闭）。")
+        return {"status": "ok", "review": fields["审核状态"], "type": app_type,
                 "row_key": rec.row_key,
                 "amount": rec.amount, "tx_count": rec.tx_count, "record_id": rid,
                 "answer_text": (f"已为《{song}》的「{blogger}」记录{label}申请"
                                 f"¥{amount:g}（{tx_count} 笔），{role_label}：{payer}。"
-                                f"申请已进入待审核状态，等管理者确认后正式生效。")}
+                                f"{review_note}")}
 
     def review_application(self, song: str, blogger: str, decision: str,
                            reason: str = "") -> dict:

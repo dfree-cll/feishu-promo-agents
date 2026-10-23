@@ -34,6 +34,8 @@ LISTEN_WORKERS = int(os.getenv("LISTEN_WORKERS", "8"))        # 群消息并发�
 MAX_CONCURRENT_LLM = int(os.getenv("MAX_CONCURRENT_LLM", "8"))  # LLM 调用并发上限（信号量）
 
 # ---------- 审批配置 ----------
+# 人工审核流开关：1 = 申请入表后进入「待审核」，需管理者回复同意/驳回；0 = 申请直接生效（已批准）
+REVIEW_ENABLED = os.getenv("REVIEW_ENABLED", "0") == "1"
 # 有权执行审核/回滚的发送者 open_id（逗号分隔）；留空 = 不校验（演示环境）
 APPROVER_OPEN_IDS = [x.strip() for x in os.getenv("APPROVER_OPEN_IDS", "").split(",") if x.strip()]
 
