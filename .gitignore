@@ -7,9 +7,7 @@ __pycache__/
 # 本地凭证（含飞书应用密钥与 LLM API Key，严禁入库）
 .env
 
-# 仅本地保留（不入库）
-CHANGELOG.md
-
+# 变更日志：现在纳入仓库（面试展示修复历程与已知限制）
 # IDE / 工具目录
 .idea/
 .mimosa/
