@@ -25,18 +25,38 @@ EVENT_BUS = config.STATE_DIR / "events.jsonl"      # Sub -> Master 的结构化�
 
 _EVENT_LOCK = threading.Lock()   # 多消息并发时保护事件总线文件追加
 
-import threading
+# ---------------------------------------------------------------- 后台聚合：单例线程 + 去抖
+# 原实现是「每笔申请起一个线程各跑一次全量重算」：突发多笔时会堆线程，
+# 且 N 次 run() 各自重算同一批事件（O(n²)）。改为一个常驻工作线程，
+# 申请只负责置位；线程等 0.4s 把这一波申请合并成一次聚合。
+_SUMMARY_WAKE = threading.Event()
+_SUMMARY_LOCK = threading.Lock()
+_SUMMARY_WORKER = None
+_DEBOUNCE_SECONDS = 0.4
 
-def _run_master_async(client: FeishuClient):
-    """Master 聚合/日报转后台线程执行：用户不等它，绿色日报卡片稍后自动出现。
-    并发串行化由 MasterAgent 内部的 _RUN_LOCK 保证。"""
-    def _job():
+
+def _summary_worker(client: FeishuClient):
+    import time as _time
+    while True:
+        _SUMMARY_WAKE.wait()
+        _SUMMARY_WAKE.clear()
+        _time.sleep(_DEBOUNCE_SECONDS)      # 去抖窗口：让同一波申请先全部写进事件总线
         try:
             from promo_agent.master_agent import MasterAgent
             MasterAgent(client).run(send_report=True)
-        except Exception as e:
+        except Exception as e:              # 后台任务不能把工作线程打死
             print(f"[Master-Agent] 后台汇总失败：{e}")
-    threading.Thread(target=_job, daemon=True, name="master-summary").start()
+
+
+def _run_master_async(client: FeishuClient):
+    """通知后台聚合（不阻塞回复）。工作线程单例常驻，多次调用合并成一次 run。"""
+    global _SUMMARY_WORKER
+    with _SUMMARY_LOCK:
+        if _SUMMARY_WORKER is None or not _SUMMARY_WORKER.is_alive():
+            _SUMMARY_WORKER = threading.Thread(target=_summary_worker, args=(client,),
+                                               daemon=True, name="master-summary")
+            _SUMMARY_WORKER.start()
+    _SUMMARY_WAKE.set()
 
 SUB_SYSTEM_PROMPT = (
     "你是音乐宣推团队的「推广助手」（Sub-Agent），常驻公司【推广群】。\n"

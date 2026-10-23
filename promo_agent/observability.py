@@ -51,8 +51,24 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="milliseconds")
 
 
+MAX_RUNS_BYTES = 8 * 1024 * 1024      # 单个结构化日志上限，超过即滚动归档
+
+
 def _append(path, obj: dict):
+    """追加一条结构化日志；obs_runs.jsonl 超过 MAX_RUNS_BYTES 时滚动归档。
+
+    归档后 snapshot() 只从当前文件重建指标，即指标窗口随归档重置
+    （历史明细仍在 obs_runs-<时间戳>.jsonl 里，可手工分析）。
+    """
     with _LOCK:
+        try:
+            if path == RUNS_FILE and path.exists() and path.stat().st_size > MAX_RUNS_BYTES:
+                # 时间戳精确到微秒：秒级时间戳下同一秒内多次归档会重名，
+                # Windows rename 到已存在文件会失败（被 except 吞掉）→ 归档形同虚设
+                arch = path.with_name(f"{path.stem}-{datetime.now():%Y%m%d-%H%M%S-%f}.jsonl")
+                path.rename(arch)
+        except OSError:
+            pass          # 归档失败不能影响正常写日志
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 

@@ -19,6 +19,7 @@ if sys.platform == "win32":
         pass
 
 from promo_agent import config
+from promo_agent.locks import file_lock
 from promo_agent.extractor import parse_any
 from promo_agent.feishu_client import FeishuClient
 from promo_agent.master_agent import MasterAgent
@@ -48,13 +49,30 @@ class SeenCache:
                 self.keys = []
 
     def first_time(self, key: str) -> bool:
-        if not key or key in self.keys:
+        """判重：**锁内重读-判断-写**。
+
+        飞书事件是"至少一次"投递，同一条消息可能被推送多次；而 listen 常驻进程
+        与 CLI 命令可能同时收到事件，各自持有一份 keys 快照，只加 threading 锁
+        并整文件覆盖会丢掉对方的记录 → 同一条消息被处理两次。
+        """
+        if not key:
             return False
-        self.keys.append(key)
-        if len(self.keys) > self.cap:
-            self.keys = self.keys[-(self.cap // 2):]
-        SEEN_FILE.write_text(json.dumps(self.keys, ensure_ascii=False), encoding="utf-8")
-        return True
+        with file_lock(SEEN_FILE):
+            keys = self.keys
+            if SEEN_FILE.exists():
+                try:
+                    keys = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
+                except Exception:
+                    keys = []
+            if key in keys:
+                self.keys = keys
+                return False
+            keys.append(key)
+            if len(keys) > self.cap:
+                keys = keys[-(self.cap // 2):]
+            SEEN_FILE.write_text(json.dumps(keys, ensure_ascii=False), encoding="utf-8")
+            self.keys = keys
+            return True
 
 
 def _clean_text(raw: str, mention_names=None) -> str:

@@ -292,3 +292,60 @@ def test_file_lock_is_reentrant_safe_across_threads(tmp_path):
         th.join()
     assert not errors
     assert int(target.read_text(encoding="utf-8")) == 80
+
+# ------------------------------------------------------------------ P1：去抖 / 去重锁 / 观测归档
+def test_run_master_async_debounces(monkeypatch):
+    """一波多笔申请只触发一次后台聚合（原来每笔一个线程、各跑一次全量重算）。"""
+    import time as _t
+
+    from promo_agent import master_agent, sub_agent
+
+    calls = []
+
+    class _FakeMaster:
+        def __init__(self, client=None):
+            pass
+
+        def run(self, send_report=True):
+            calls.append(1)
+            return []
+
+    monkeypatch.setattr(master_agent, "MasterAgent", _FakeMaster)
+    sub_agent._SUMMARY_WORKER = None
+    sub_agent._SUMMARY_WAKE.clear()
+
+    for _ in range(5):                     # 模拟同一波 5 笔申请
+        sub_agent._run_master_async(None)
+    _t.sleep(1.2)                          # 去抖窗口 0.4s + 执行时间
+
+    assert len(calls) == 1, f"应合并为 1 次聚合，实际 {len(calls)} 次"
+
+
+def test_seen_cache_dedupes_across_instances(monkeypatch, tmp_path):
+    """两个 SeenCache 实例（模拟两个进程）不能重复消费同一个 event_id。"""
+    from promo_agent import listener
+
+    monkeypatch.setattr(listener, "SEEN_FILE", tmp_path / "seen.json")
+    a = listener.SeenCache()
+    assert a.first_time("evt-1") is True
+    assert a.first_time("evt-1") is False
+
+    b = listener.SeenCache()               # 另一个实例（等价于另一个进程）
+    assert b.first_time("evt-1") is False  # 必须能看到 a 写下的去重记录
+    assert a.first_time("evt-2") is True
+
+
+def test_obs_runs_rotated_when_too_large(monkeypatch, tmp_path):
+    """obs_runs.jsonl 超过阈值要滚动归档，不能无限增长。"""
+    from promo_agent import observability as obs
+
+    runs = tmp_path / "obs_runs.jsonl"
+    monkeypatch.setattr(obs, "RUNS_FILE", runs)
+    monkeypatch.setattr(obs, "MAX_RUNS_BYTES", 300)
+
+    for i in range(60):
+        obs.log_event("probe", i=i)
+
+    archives = list(tmp_path.glob("obs_runs-*.jsonl"))
+    assert archives, "超过阈值后应产生归档文件"
+    assert runs.exists() and runs.stat().st_size <= 2 * 300
