@@ -71,15 +71,31 @@ class SummaryEvent:
     produced_by: str = "sub_agent_promotion"
     produced_at: str = field(default_factory=now_iso)
     warnings: List[str] = field(default_factory=list)
+    # 幂等维度：这条事件来自哪条飞书消息的第几个申请块。
+    # 有值 → 用「消息 ID + 块序号」派生 event_id（消息级幂等）；
+    # 为空 → 退回内容哈希（CLI ingest / 单测无消息上下文）。
+    source_message_id: str = ""
+    block_index: int = 0
 
     def __post_init__(self):
-        # 事件 ID 由内容确定性生成：同一份申请总结重复摄入不会产生新事件（端到端幂等）
+        """生成确定性 event_id。
+
+        为什么不能只用内容哈希：台账金额是**累加**的，而事件按内容去重。
+        - 同一段文本用两条消息各发一次（员工复制粘贴发两遍）→ 内容相同、event_id 相同
+          → 台账累加两次(600) 而日报只算一次(300)，两本账分叉；
+        - 同一博主同一天两笔金额完全相同的真实申请 → 内容相同 → 日报少算。
+        改成「消息 ID + 块序号」派生后：同一条消息重推 → 同 ID（去重）；
+        两条消息各发一次 → 不同 ID（都算），台账与日报口径一致。
+        """
         import hashlib
-        payload = json.dumps({
-            "t": self.event_type, "d": self.summary_date,
-            "r": sorted([[r.song, r.blogger, r.amount, r.tx_count] for r in self.records]),
-            "tot": self.stated_total, "payer": self.payer,
-        }, ensure_ascii=False, sort_keys=True)
+        if self.source_message_id:
+            payload = f"msg|{self.event_type}|{self.source_message_id}|{self.block_index}"
+        else:
+            payload = json.dumps({
+                "t": self.event_type, "d": self.summary_date,
+                "r": sorted([[r.song, r.blogger, r.amount, r.tx_count] for r in self.records]),
+                "tot": self.stated_total, "payer": self.payer,
+            }, ensure_ascii=False, sort_keys=True)
         self.event_id = "evt_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
     @property

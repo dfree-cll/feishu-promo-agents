@@ -520,3 +520,82 @@ def test_api_rate_limit_retries_even_for_write(monkeypatch):
     with pytest.raises(fc.FeishuError):
         c._api("POST", "/open-apis/im/v1/messages", {})
     assert fake.calls == 3
+
+# ------------------------------------------------------------------ 0.7.8：幂等键与防御
+def test_event_id_uses_message_id_when_available():
+    """同一条消息重推 → 同 event_id；两条消息发同样文本 → 不同 event_id（都要算）。"""
+    text = ("【抖加金额统计】今日已支付：¥300（2026-10-27）\n"
+            "歌名：《幂等测试》 - 博主名：初秋 - 金额：¥300（分 1 笔）\n"
+            "抖加支付人：爆火音乐")
+
+    e1, _ = parse_any(text, message_id="om_msg_A")
+    e2, _ = parse_any(text, message_id="om_msg_A")      # 同一条消息被重推
+    e3, _ = parse_any(text, message_id="om_msg_B")      # 另一条消息发同样内容
+
+    assert e1[0].event_id == e2[0].event_id, "同一消息重推必须幂等"
+    assert e1[0].event_id != e3[0].event_id, "两条消息各发一次应视为两次提交"
+
+
+def test_event_id_falls_back_to_content_hash_without_message_id():
+    """无消息上下文（CLI ingest / 单测）仍按内容哈希，保持旧行为。"""
+    text = ("【垫付统计】今日已垫付：¥500（2026-10-27）\n"
+            "申请为【达人：艳红】垫付 ¥500（歌曲《X》）\n"
+            "打款人：林老师")
+    a, _ = parse_any(text)
+    b, _ = parse_any(text)
+    assert a[0].event_id == b[0].event_id
+
+
+def test_aggregate_skips_event_with_empty_records():
+    """records 为空的历史脏事件不能把聚合打挂（events.jsonl 可被手工编辑）。"""
+    agent = _agent()
+    grouped = agent.aggregate([
+        {"event_type": "doujia_summary", "summary_date": "2026-10-27",
+         "payer": "p", "records": []},
+        {"event_type": "doujia_summary", "summary_date": "2026-10-27",
+         "payer": "p", "records": [{"song": "S", "blogger": "b",
+                                    "amount": 100, "tx_count": 1}]},
+    ])
+    assert set(grouped) == {("2026-10-27", "S")}
+    assert grouped[("2026-10-27", "S")].doujia_total == 100
+
+
+def test_api_non_json_response_raises_feishu_error(monkeypatch):
+    """网关 502 返回 HTML 时要抛 FeishuError，而不是裸 JSONDecodeError。"""
+    class _HtmlResp:
+        status_code = 502
+        text = "<html>502 Bad Gateway</html>"
+
+        def json(self):
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    fake = _FakeHTTP(resp=_HtmlResp())
+    c = _client_with(fake)
+    with pytest.raises(fc.FeishuError):
+        c._api("GET", "/open-apis/x")
+    assert fake.calls == 3          # 读操作遇 5xx 仍重试
+
+
+def test_nonretryable_write_error_stops_tool_loop(monkeypatch):
+    """「写可能已执行」的错误必须直接终止工具循环，不能把控制权交回模型（否则重复记账）。"""
+    from promo_agent import llm_client
+
+    calls = {"chat": 0}
+
+    def fake_chat(messages, tools=None, temperature=0.2):
+        calls["chat"] += 1
+        return {"content": "", "tool_calls": [{
+            "id": "call_1",
+            "function": {"name": "submit_application", "arguments": "{}"},
+        }]}
+
+    monkeypatch.setattr(llm_client, "chat", fake_chat)
+
+    def executor(fn, args):
+        raise fc.FeishuError("写超时", retryable=False,
+                             answer_text="这笔可能已提交，请人工核对台账，不要重复提交。")
+
+    out = llm_client.run_tool_loop([{"role": "user", "content": "提交"}], [], executor)
+    assert "人工核对" in out
+    assert calls["chat"] == 1       # 只调一次模型就终止，没有给它重试机会

@@ -169,6 +169,11 @@ class MasterAgent:
         out: List[dict] = []
         for ev in events:
             records = ev.get("records") or []
+            if not records:
+                # 脏事件防御：events.jsonl 是纯文本，可被手工编辑/历史遗留污染；
+                # 空 records 会让 aggregate() 的 records[0] 直接 IndexError，
+                # 一条脏事件就能把整个后台聚合线程打挂。
+                continue
             songs: List[str] = []
             for rec in records:
                 s = rec.get("song") or ""
@@ -291,9 +296,13 @@ class MasterAgent:
         if not EVENT_BUS.exists():
             print(f"[{self.name}] {day} 无任何申请记录。")
             return []
-        day_events = [json.loads(line) for line in
-                      EVENT_BUS.read_text(encoding="utf-8").splitlines()
-                      if line.strip() and json.loads(line).get("summary_date") == day]
+        day_events = []
+        for line in EVENT_BUS.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            ev = json.loads(line)          # 原来对同一行 json.loads 了两次
+            if ev.get("summary_date") == day:
+                day_events.append(ev)
         if not day_events:
             print(f"[{self.name}] {day} 当日无申请，跳过日终总结。")
             return []

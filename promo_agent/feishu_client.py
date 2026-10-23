@@ -23,6 +23,17 @@ PAGE_SIZE_MAX = 500   # 飞书多维表格 records/search 单页上限
 
 
 class FeishuError(RuntimeError):
+    """飞书 API 错误。
+
+    retryable=False 表示**操作可能已在服务端执行**（写操作读超时 / 5xx）：
+    上层（工具循环、Agent）禁止自动重试，必须人工核对，
+    否则会重复记账、重复发送消息。
+    """
+
+    def __init__(self, message: str, retryable: bool = True, answer_text: str = ""):
+        super().__init__(message)
+        self.retryable = retryable
+        self.answer_text = answer_text
     pass
 
 
@@ -102,7 +113,11 @@ class FeishuClient:
                 if is_write:
                     raise FeishuError(
                         f"{method_u} {path} 读超时：写操作可能已在服务端执行，"
-                        f"为避免重复副作用不再重试（{e}）")
+                        f"为避免重复副作用不再重试（{e}）",
+                        retryable=False,
+                        answer_text=("这笔操作可能已经提交成功了，但服务端回执丢失。"
+                                     "为避免重复记账，系统没有自动重试——"
+                                     "请先在《推广账号表》里核对这笔记录，确认没有再重新提交。"))
                 last_err = e
                 if attempt < self._MAX_ATTEMPTS - 1:
                     time.sleep(2 ** attempt)
@@ -116,7 +131,18 @@ class FeishuClient:
                     continue
                 break
 
-            data = r.json()
+            try:
+                data = r.json()
+            except ValueError:
+                # 网关 502/504 常返回 HTML 错误页：不包起来会抛裸 JSONDecodeError，
+                # 绕过 FeishuError 语义、也让 5xx 重试逻辑失效。
+                last_err = FeishuError(
+                    f"{method_u} {path} 返回非 JSON（HTTP {r.status_code}）："
+                    f"{getattr(r, 'text', '')[:200]}")
+                if r.status_code >= 500 and not is_write and attempt < self._MAX_ATTEMPTS - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise last_err
             if data.get("code") == 0:
                 return data.get("data", {})
 
@@ -131,7 +157,11 @@ class FeishuClient:
                 if is_write:
                     raise FeishuError(
                         f"{method_u} {path} 服务端 {r.status_code}：写操作可能已执行，"
-                        f"不自动重试（{data}）")
+                        f"不自动重试（{data}）",
+                        retryable=False,
+                        answer_text=("这笔操作可能已经提交成功了（服务端返回错误但可能已执行）。"
+                                     "为避免重复记账，系统没有自动重试——"
+                                     "请先在《推广账号表》里核对这笔记录，确认没有再重新提交。"))
                 if attempt < self._MAX_ATTEMPTS - 1:
                     time.sleep(2 ** attempt)
                     continue
@@ -349,9 +379,12 @@ class FeishuClient:
                       additive_fields: tuple = ()) -> str:
         """按唯一键 upsert：已存在则「合并字段后整体写回」，避免覆盖另一侧（抖加/垫付）的列。
 
-        create_defaults：仅在【新建行】时补入的初始值（如 是否接单=已接单、
-        是否打款=待打款）。已存在的行不会被它覆盖，从而保证
+        create_defaults：仅在【新建行】时补入的初始值（是否接单=待确认、
+        垫付才带 是否打款=待打款）。已存在的行不会被它覆盖，从而保证
         update_order_status / mark_paid 回写的真实状态不被后续申请冲掉。
+
+        additive_fields：需要「旧值 + 新值」累加的列（金额/笔数）。
+        台账是博主维度总账，同一博主的多次申请必须累计，不能被后一笔覆盖。
         """
         record_id, old_fields = self.find_record(app_token, table_id, key_field, key_value)
         old_fields = {k: self._to_write_format(v) for k, v in (old_fields or {}).items()}
@@ -520,6 +553,10 @@ class FeishuClient:
             return True
         except FeishuError as e:
             print(f"[警告] 卡片更新失败（不影响结果）：{e}")
+            if not getattr(e, "retryable", True):
+                # 读超时/5xx：卡片很可能已经更新成功，只是回执丢了。
+                # 这里抛给上层，让它不要再补发一张（否则群里出现两张结果卡）。
+                raise
             return False
 
     def _send_webhook(self, card: dict):

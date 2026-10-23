@@ -167,12 +167,22 @@ def parse_summary(text: str, source: str = "推广群") -> SummaryEvent:
     )
 
 
-def parse_any(text: str, source: str = "推广群") -> Tuple[List[SummaryEvent], List[str]]:
-    """容错入口：自动切分多段（分隔线或汇总头）申请总结，无法识别的段进入 errors。"""
+def parse_any(text: str, source: str = "推广群",
+              message_id: str = "") -> Tuple[List[SummaryEvent], List[str]]:
+    """容错入口：自动切分多段（分隔线或汇总头）申请总结，无法识别的段进入 errors。
+
+    message_id：飞书消息 ID。传入后事件的幂等键由「消息 ID + 块序号」派生，
+    这样同一条消息重复投递只会算一次，而两条消息各发一次同样的文本会算两次
+    （与台账的累加语义保持一致）。
+    """
     blocks = _split_blocks(text) or [text.strip()]
     events, errors, seen = [], [], set()
-    for b in blocks:
+    for idx, b in enumerate(blocks):
         ev = parse_summary(b, source)
+        if ev.source_message_id != message_id or ev.block_index != idx:
+            ev.source_message_id = message_id
+            ev.block_index = idx
+            ev.__post_init__()          # 幂等维度变了 → 重算 event_id
         if not ev.records:
             errors.append(f"未能识别的申请文本（扩展点：可接入 LLM 抽取）：\n{b[:120]}")
             continue

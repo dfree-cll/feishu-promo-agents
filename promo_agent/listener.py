@@ -124,7 +124,8 @@ def run():
         return (f"\n\n📊 [打开《推广账号表》]({promo_url})"
                 f" ｜ 📈 [打开《综合管理表》]({mgmt_url})")
 
-    def _process(text: str, chat_id: str, sender: str = "", msg_time: str = ""):
+    def _process(text: str, chat_id: str, sender: str = "", msg_time: str = "",
+                 message_id: str = ""):
         try:
             print(f"\n[监听] 开始处理（提交时间 {msg_time or '未知'}）：{text[:80]}")
 
@@ -135,7 +136,8 @@ def run():
                 fast_events, _ = parse_any(text)
                 if fast_events:
                     print("[路由] 命中标准格式，走规则快速路径")
-                    sub.ingest_text(text, table_url=table_urls()[0], msg_time=msg_time)
+                    sub.ingest_text(text, table_url=table_urls()[0], msg_time=msg_time,
+                                    message_id=message_id)
                     master.run()
                     return
                 # Agent 路径：先秒回“处理中”回执卡（带提交时间），完成后原地更新为结果
@@ -148,14 +150,22 @@ def run():
                             + (f"\n\n🕘 提交时间：{msg_time}" if msg_time else ""))
                 done = False
                 if ack_id:
-                    done = client.update_card(ack_id, "【推广助手】回复", markdown,
-                                              template="blue")
+                    try:
+                        done = client.update_card(ack_id, "【推广助手】回复", markdown,
+                                                  template="blue")
+                    except Exception as e:      # noqa: BLE001
+                        if not getattr(e, "retryable", True):
+                            # 更新超时：卡片很可能已更新成功，再补发会在群里出现两张结果卡
+                            print(f"[监听] 回执卡更新超时（可能已成功），跳过补发：{e}")
+                            return
+                        done = False
                 if not done:
                     client.send_card("【推广助手】回复", markdown,
                                      template="blue", to_chat_id=chat_id)
                 return
             # 兜底路径：规则解析（未配置 LLM Key 时）
-            events = sub.ingest_text(text, table_url=table_urls()[0], msg_time=msg_time)
+            events = sub.ingest_text(text, table_url=table_urls()[0], msg_time=msg_time,
+                                     message_id=message_id)
             if not events:
                 client.send_card("未识别的申请消息", _UNKNOWN_HELP + table_footer(),
                                  template="grey", to_chat_id=chat_id)
@@ -197,7 +207,8 @@ def run():
                 pass
             obs.observe_message()
             print(f"\n[监听] 收到群消息（提交时间 {msg_time}）：{text[:80]}")
-            pool.submit(_process, text, msg.chat_id, sender, msg_time)   # 并发处理，不阻塞下一条消息
+            pool.submit(_process, text, msg.chat_id, sender, msg_time,
+                        getattr(msg, "message_id", "") or "")   # 并发处理，不阻塞下一条消息
         except Exception as e:
             print(f"[监听] 事件分发出错：{e}")
 

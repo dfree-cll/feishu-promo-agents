@@ -82,7 +82,16 @@ def run_tool_loop(messages: List[dict], tools: List[dict],
             try:
                 result = executor(fn, args)
                 ok = not (isinstance(result, dict) and result.get("error"))
-            except Exception as e:  # 工具报错也回填给模型，让它自己决定重试或追问
+            except Exception as e:  # noqa: BLE001
+                # 不可重试的写失败（retryable=False，例如写台账读超时）：
+                # 此时服务端可能已经执行，绝不能把控制权交回模型——模型会立刻再调一次
+                # submit_application，导致台账重复累加。直接终止循环，返回人工核对提示。
+                if not getattr(e, "retryable", True):
+                    hint = getattr(e, "answer_text", "") or (
+                        "操作可能已经执行成功，但回执丢失。为避免重复记账，系统没有自动重试——"
+                        "请先核对台账，确认没有再重新提交。")
+                    obs.observe_tool(fn, time.time() - t0, False)
+                    return str(hint)
                 result = {"error": f"{type(e).__name__}: {e}"}
                 ok = False
             obs.observe_tool(fn, time.time() - t0, ok)

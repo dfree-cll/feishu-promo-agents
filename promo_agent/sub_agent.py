@@ -2,8 +2,9 @@
 """
 Sub-Agent「推广助手」——真正的 LLM Agent：
 - 大脑：LLM + function-calling 循环（llm_client.run_tool_loop），控制流由模型决定；
-- 手：write_doujia / write_dianfu / lookup_promo_table / notify_master /
-      update_order_status / mark_paid / ask_master；
+- 手：submit_application（写台账 + 结构化上报一步完成）/ lookup_promo_table /
+      update_order_status / mark_paid / review_application / rollback_last_change /
+      recall_recent_applications / search_knowledge / ask_master；
 - 参数安全：LLM 生成的工具参数一律先经过 validators 白名单校验才落库；
 - 结构化上报：模型按协议构造 SummaryEvent JSON 上交 Master（题目题眼）；
 - 兜底：未配置 LLM 时保留原规则解析管道（ingest_text）。
@@ -25,6 +26,30 @@ from promo_agent.table_schema import (PROMO_TABLE, PROMO_FIELDS,
 EVENT_BUS = config.STATE_DIR / "events.jsonl"      # Sub -> Master 的结构化事件通道
 
 _EVENT_LOCK = threading.Lock()   # 多消息并发时保护事件总线文件追加
+
+
+def _event_exists(event_id: str) -> bool:
+    """事件总线上是否已存在该幂等键。
+
+    写台账**之前**必须先查：台账金额是累加的，一旦同一笔被处理两次就会翻倍，
+    而日报按事件去重只算一次 → 两本账分叉。这里以事件总线为准做判重
+    （事件是先算好 event_id 再上报的，天然就是"已应用"的凭据）。
+    """
+    if not event_id or not EVENT_BUS.exists():
+        return False
+    try:
+        lines = EVENT_BUS.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            if json.loads(line).get("event_id") == event_id:
+                return True
+        except json.JSONDecodeError:
+            continue
+    return False
 
 # ---------------------------------------------------------------- 后台聚合：单例线程 + 去抖
 # 原实现是「每笔申请起一个线程各跑一次全量重算」：突发多笔时会堆线程，
@@ -150,8 +175,9 @@ class SubAgent:
 
     # ---------- 兜底路径：规则解析（离线/无 LLM 时可用）----------
     def ingest_text(self, text: str, notify_master: bool = True, table_url: str = "",
-                    msg_time: str = "") -> List[SummaryEvent]:
-        events, errors = parse_any(text)
+                    msg_time: str = "", message_id: str = "") -> List[SummaryEvent]:
+        """规则路径摄入。message_id 用于派生消息级幂等键：同一条消息重复投递只算一次。"""
+        events, errors = parse_any(text, message_id=message_id)
         for err in errors:
             print(f"[{self.name}] ⚠️ {err}")
 
@@ -166,6 +192,11 @@ class SubAgent:
             if not ev.summary_date:
                 ev.summary_date = today
                 ev.__post_init__()   # 日期变了 —— 按新内容重算确定性 event_id
+            if _event_exists(ev.event_id):
+                # 幂等：这段申请已经处理过（消息重推 / 同一条消息被重复分发），
+                # 不能再写台账——台账是累加语义，重复写会翻倍。
+                print(f"[{self.name}] ♻️ 该申请已处理过（幂等键 {ev.event_id}），跳过重复写入")
+                continue
             written = 0
             for rec in ev.records:
                 rec.summary_date = rec.summary_date or ev.summary_date
@@ -355,6 +386,19 @@ class SubToolExecutor:
                                 amount=amount, tx_count=tx_count,
                                 summary_date=date, payer=payer, submitted_at=submitted_at,
                                 expected_pay_date=expected_pay_date)
+        # 先构造事件拿到幂等键（内容哈希）：模型若因错误重试同一次提交，
+        # 内容一致 → event_id 一致 → 这里能拦住，避免台账重复累加。
+        ev = SummaryEvent(
+            event_type=app_type + "_summary", summary_date=date,
+            records=[rec], stated_total=stated_total, stated_count=stated_count,
+            payer=payer, expected_pay_date=expected_pay_date,
+        )
+        if _event_exists(ev.event_id):
+            return {
+                "status": "duplicate", "duplicate": True, "row_key": rec.row_key,
+                "answer_text": (f"《{song}》的「{blogger}」这笔 ¥{amount:g} 申请之前已经记录过了，"
+                                f"本次没有重复写入（幂等）。"),
+            }
         app_token = self.client.ensure_bitable()
         table_id = self.client.ensure_table(app_token, PROMO_TABLE, PROMO_FIELDS)
         fields = promo_record_fields(rec.to_dict())
@@ -367,11 +411,6 @@ class SubToolExecutor:
         memory.add_status_change(rec.row_key, "审核状态", "", fields["审核状态"])
         label = "抖加" if app_type == "doujia" else "垫付"
         role_label = "支付人" if app_type == "doujia" else "打款人"
-        ev = SummaryEvent(
-            event_type=app_type + "_summary", summary_date=date,
-            records=[rec], stated_total=stated_total, stated_count=stated_count,
-            payer=payer, expected_pay_date=expected_pay_date,
-        )
         self.agent.notify_master(ev)
         _run_master_async(self.client)   # 聚合/日报转后台，不阻塞回复
         # 审批请求卡：仅人工审核流开启时发送
