@@ -13,7 +13,7 @@ import pytest
 
 from promo_agent import config
 from promo_agent import feishu_client as fc
-from promo_agent.extractor import parse_summary
+from promo_agent.extractor import parse_any, parse_summary
 from promo_agent.master_agent import MasterAgent
 from promo_agent.models import ApplicationRecord, SongDailyReport, SummaryEvent
 from promo_agent.sub_agent import SubAgent, SubToolExecutor
@@ -385,3 +385,53 @@ def test_upsert_accumulates_amount_columns(monkeypatch):
     c.upsert_record(app, tid, "行键", "歌A|初秋", {"行键": "歌A|初秋", "报价": 450})
     rec = store["bitables"][app]["tables"][tid]["records"][rid]
     assert rec["报价"] == 450
+
+# ------------------------------------------------------------------ 混合消息（0.7.6）
+def test_parse_combined_message_without_separator():
+    """抖加段 + 垫付段直接连写（无 --- 分隔）也要各自识别，且不产生跨类型假告警。"""
+    text = (
+        "【抖加金额统计】今日已支付：¥1500（2026-10-25）\n\n"
+        "歌名：《合并测试》 - 博主名：初秋 - 金额：¥800（分 2 笔）\n"
+        "歌名：《合并测试》 - 博主名：艳红 - 金额：¥700（分 1 笔）\n\n"
+        "抖加支付人：爆火音乐\n\n"
+        "【垫付统计】今日已垫付：¥1200（2026-10-25）\n\n"
+        "明细如下：\n"
+        "申请为【达人：初秋】垫付 ¥1000（歌曲《合并测试》）\n"
+        "申请为【达人：艳红】垫付 ¥200（歌曲《合并测试》）\n\n"
+        "今日共 2 笔垫付申请。\n\n"
+        "打款人：林老师\n"
+        "预计打款日期：26/10/27"
+    )
+    events, errors = parse_any(text)
+    assert not errors
+    assert len(events) == 2, [e.event_type for e in events]
+
+    dj = next(e for e in events if e.event_type == "doujia_summary")
+    df = next(e for e in events if e.event_type == "dianfu_summary")
+    assert dj.detail_total == 1500 and len(dj.records) == 2
+    assert df.detail_total == 1200 and len(df.records) == 2
+    assert dj.payer == "爆火音乐" and df.payer == "林老师"
+    assert df.expected_pay_date == "2026-10-27"
+    # 关键：不能出现"拿抖加汇总头比垫付明细"的假告警
+    assert dj.warnings == [] and df.warnings == []
+
+
+def test_parse_combined_message_with_separator_still_works():
+    """带 --- 分隔的老写法不能因为这次改造而回归。"""
+    text = (
+        "【抖加金额统计】今日已支付：¥300（2026-10-26）\n"
+        "歌名：《A》 - 博主名：初秋 - 金额：¥300（分 1 笔）\n"
+        "抖加支付人：爆火音乐\n"
+        "---\n"
+        "【垫付统计】今日已垫付：¥500（2026-10-26）\n"
+        "申请为【达人：艳红】垫付 ¥500（歌曲《A》）\n"
+        "打款人：林老师"
+    )
+    events, errors = parse_any(text)
+    assert not errors
+    assert len(events) == 2
+    assert {e.event_type for e in events} == {"doujia_summary", "dianfu_summary"}
+    dj = next(e for e in events if e.event_type == "doujia_summary")
+    df = next(e for e in events if e.event_type == "dianfu_summary")
+    assert dj.detail_total == 300 and df.detail_total == 500
+    assert dj.warnings == [] and df.warnings == []

@@ -21,9 +21,10 @@ _RE_DOUJIA_LINE = re.compile(
 _RE_DIANFU_LINE = re.compile(
     r"申请为\s*【达人[：:]\s*(.+?)】\s*垫付\s*[¥￥]?\s*([\d,]+(?:\.\d+)?)\s*[（(]歌曲《(.+?)》[）)]"
 )
-# 汇总头：【抖加金额统计】今日已支付：¥700（2026-09-02）
+# 汇总头：【抖加金额统计】今日已支付：¥700（2026-09-02）/【垫付统计】今日已垫付：¥2595（…）
+# 限定标题必须含"抖加/垫付"，避免误匹配明细行里的【达人：X】等
 _RE_HEADER = re.compile(
-    r"【(.+?)】.*?[¥￥]?\s*([\d,]+(?:\.\d+)?)\s*[（(](\d{4}-\d{2}-\d{2})[）)]"
+    r"【([^】]{0,40}(?:抖加|垫付)[^】]{0,30})】[^\n]*?[¥￥]?\s*([\d,]+(?:\.\d+)?)\s*[（(](\d{4}-\d{2}-\d{2})[）)]"
 )
 # 今日共 N 笔
 _RE_COUNT = re.compile(r"今日共\s*(\d+)\s*笔")
@@ -44,18 +45,73 @@ def _norm_expected_date(m: re.Match) -> str:
 
 
 def _detect_type(text: str) -> str:
+    """无汇总头时的兜底判型（保留旧行为）。"""
     if "申请为【达人" in text or "垫付" in text:
         return DIANFU
     return DOUJIA
 
 
+def _header_type(header_text: str) -> str:
+    """汇总头判型：【…垫付…】→ 垫付；其余（含"抖加"）→ 抖加。"""
+    return DIANFU if "垫付" in header_text else DOUJIA
+
+
+def _split_blocks(text: str) -> List[str]:
+    """把一段消息切成「单类型申请块」。
+
+    切分依据（从强到弱）：
+    1. 显式分隔线 `---`
+    2. **汇总头出现的位置**（【抖加金额统计】… /【垫付统计】…）
+
+    以前只认 `---`，群里把抖加段和垫付段直接连写时会整段被判成垫付：
+    抖加明细静默丢弃，而且拿抖加的汇总头去比垫付的明细，产生一条
+    "金额口径不一致 ¥300" 的**假告警**。按汇总头切块后不再依赖分隔符。
+    """
+    blocks: List[str] = []
+    for chunk in re.split(r"\n\s*-{3,}\s*\n", text):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        heads = list(_RE_HEADER.finditer(chunk))
+        if len(heads) <= 1:
+            blocks.append(chunk)
+            continue
+        for i, m in enumerate(heads):
+            end = heads[i + 1].start() if i + 1 < len(heads) else len(chunk)
+            part = chunk[m.start():end].strip()
+            if part:
+                blocks.append(part)
+    return blocks
+
+
 def parse_summary(text: str, source: str = "推广群") -> SummaryEvent:
     """解析一段“抖加申请总结”或“垫付申请总结”文本 -> SummaryEvent。"""
     text = text.strip()
-    app_type = _detect_type(text)
     warnings: List[str] = []
 
     header = _RE_HEADER.search(text)
+    # 类型判定：优先用本块的汇总头（块已被 _split_blocks 切成单类型），
+    # 没有汇总头时按明细行形态推断，最后才退回旧的"含垫付即垫付"兜底。
+    if header:
+        app_type = _header_type(header.group(1))
+    else:
+        has_dianfu_line = _RE_DIANFU_LINE.search(text) is not None
+        has_doujia_line = _RE_DOUJIA_LINE.search(text) is not None
+        if has_dianfu_line and not has_doujia_line:
+            app_type = DIANFU
+        elif has_doujia_line and not has_dianfu_line:
+            app_type = DOUJIA
+        else:
+            app_type = _detect_type(text)
+
+    # 极端情况（一个汇总头却混了另一类明细）不能静默丢数据，必须告警
+    if app_type == DIANFU and _RE_DOUJIA_LINE.search(text):
+        warnings.append("本段含抖加明细但汇总头为垫付：本次仅处理垫付，"
+                        "请用 --- 分隔或分开发送")
+    if app_type == DOUJIA and _RE_DIANFU_LINE.search(text):
+        warnings.append("本段含垫付明细但汇总头为抖加：本次仅处理抖加，"
+                        "请用 --- 分隔或分开发送")
+
     stated_total = _to_amount(header.group(2)) if header else 0.0
     summary_date = header.group(3) if header else ""
 
@@ -112,13 +168,16 @@ def parse_summary(text: str, source: str = "推广群") -> SummaryEvent:
 
 
 def parse_any(text: str, source: str = "推广群") -> Tuple[List[SummaryEvent], List[str]]:
-    """容错入口：自动切分文本中的多段申请总结；无法识别的行进入 errors。"""
-    blocks = [b.strip() for b in re.split(r"\n\s*-{3,}\s*\n", text) if b.strip()]
-    events, errors = [], []
-    for b in (blocks or [text.strip()]):
+    """容错入口：自动切分多段（分隔线或汇总头）申请总结，无法识别的段进入 errors。"""
+    blocks = _split_blocks(text) or [text.strip()]
+    events, errors, seen = [], [], set()
+    for b in blocks:
         ev = parse_summary(b, source)
         if not ev.records:
             errors.append(f"未能识别的申请文本（扩展点：可接入 LLM 抽取）：\n{b[:120]}")
-        else:
-            events.append(ev)
+            continue
+        if ev.event_id in seen:      # 同一内容被重复切到时只保留一个事件
+            continue
+        seen.add(ev.event_id)
+        events.append(ev)
     return events, errors
