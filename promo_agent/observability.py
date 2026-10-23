@@ -27,6 +27,7 @@ METRICS_FILE = config.STATE_DIR / "metrics.json"
 
 _LOCK = threading.Lock()
 _CTX = threading.local()          # 当前线程绑定的 run_id
+_M_LOCK = threading.Lock()        # 指标计数锁：与文件写锁 _LOCK 分离，避免与 log_event 互相死锁
 
 _METRICS = {
     "messages": 0,          # 收到的群消息数
@@ -38,6 +39,12 @@ _METRICS = {
     "cards_sent": 0,        # 发出的消息卡片数
     "errors": 0,            # 错误总数
 }
+
+
+def _incr(key: str, delta: float = 1):
+    """线程安全地累加一个计数器（多个 worker 线程并发观察时不会丢计数）。"""
+    with _M_LOCK:
+        _METRICS[key] = round(_METRICS.get(key, 0) + delta, 3)
 
 
 def _now() -> str:
@@ -69,7 +76,7 @@ def log_event(event: str, run_id: str = "", **fields):
 
 
 def log_error(where: str, error: str, run_id: str = ""):
-    _METRICS["errors"] += 1
+    _incr("errors")
     obj = {"ts": _now(), "run_id": run_id or current_run(), "where": where,
            "error": str(error)[:300]}
     _append(ERRORS_FILE, obj)
@@ -77,29 +84,32 @@ def log_error(where: str, error: str, run_id: str = ""):
 
 
 def observe_llm(latency_s: float, tool_calls: int = 0):
-    _METRICS["llm_calls"] += 1
-    _METRICS["llm_latency_s"] = round(_METRICS["llm_latency_s"] + latency_s, 3)
+    _incr("llm_calls")
+    _incr("llm_latency_s", latency_s)
     log_event("llm_call", latency_s=round(latency_s, 2), tool_calls=tool_calls)
 
 
 def observe_tool(name: str, latency_s: float, ok: bool = True):
-    _METRICS["tool_calls"] += 1
+    _incr("tool_calls")
     if not ok:
-        _METRICS["tool_errors"] += 1
+        _incr("tool_errors")
     log_event("tool_call", tool=name, latency_s=round(latency_s, 2), ok=ok)
 
 
 def observe_card():
-    _METRICS["cards_sent"] += 1
+    # 必须同时写一条结构化事件：snapshot() 是从 obs_runs.jsonl 重建指标的，
+    # 只 _incr 内存计数会在下次重建时归零（实测 metrics 里卡片数恒为 0 的根因）。
+    _incr("cards_sent")
+    log_event("card_sent")
 
 
 def observe_message():
-    _METRICS["messages"] += 1
+    _incr("messages")
     log_event("message_received")
 
 
 def observe_agent_run(run_id: str, latency_s: float, source: str = ""):
-    _METRICS["agent_runs"] += 1
+    _incr("agent_runs")
     log_event("agent_run_end", run_id=run_id, latency_s=round(latency_s, 2), source=source)
 
 
@@ -137,6 +147,8 @@ def snapshot() -> dict:
                 m["tool_calls"] += 1
                 if not o.get("ok", True):
                     m["tool_errors"] += 1
+            elif ev == "card_sent":
+                m["cards_sent"] += 1
             elif ev == "error":
                 m["errors"] += 1
     m["llm_latency_s"] = round(m["llm_latency_s"], 2)

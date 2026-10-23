@@ -29,6 +29,7 @@ PROMO_FIELDS = [
     {"field_name": "是否接单", "type": T_SELECT, "property": {"options": [{"name": "已接单"}, {"name": "待确认"}, {"name": "已拒绝"}]}},
     {"field_name": "审核状态", "type": T_SELECT, "property": {"options": [{"name": "待审核"}, {"name": "已批准"}, {"name": "已驳回"}]}},
     {"field_name": "审核备注", "type": T_TEXT},
+    {"field_name": "提交时间", "type": T_TEXT},   # 群消息采集时间（防止员工忘写时间）
     {"field_name": "申请日期", "type": T_DATE, "property": {"date_formatter": "yyyy/MM/dd", "auto_fill": False}},
     {"field_name": "来源",     "type": T_TEXT},
 ]
@@ -72,12 +73,15 @@ def promo_record_fields(rec_dict: dict) -> dict:
 
     注：报价/抖音号/账号类型/发布日期 属于投放前预置的主档信息，
     由名单预置（seed_roster）维护，申请写入不覆盖。
+    注：是否接单/是否打款 是执行态字段，由状态回写工具维护；
+    新建行时的初始值见 PROMO_NEW_ROW_DEFAULTS，不在此处写。
     """
     f = {
         "行键": rec_dict["row_key"],
         "歌曲名": rec_dict["song"],
         "博主名": rec_dict["blogger"],
         "申请日期": _ts(rec_dict["summary_date"]),
+        "提交时间": rec_dict.get("submitted_at", ""),
         "来源": rec_dict.get("source", ""),
         "审核状态": "待审核",
     }
@@ -86,17 +90,31 @@ def promo_record_fields(rec_dict: dict) -> dict:
             "抖加金额": rec_dict["amount"],
             "抖加笔数": rec_dict["tx_count"],
             "抖加支付人": rec_dict["payer"],
-            "是否接单": "已接单",   # 演示默认；真实环境可由达人反馈回写
         })
     else:
         f.update({
             "垫付金额": rec_dict["amount"],
-            "是否打款": "待打款",
             "打款人": rec_dict["payer"],
             "预计打款日期": _ts(rec_dict["expected_pay_date"]),
-            "是否接单": "已接单",
         })
     return {k: v for k, v in f.items() if v is not None}
+
+
+# 仅在“新建行”时写入的默认值（不参与后续 upsert 合并）。
+# 放进这里而不是 promo_record_fields，是为了避免重复提交申请时把
+# update_order_status / mark_paid 回写的真实状态冲回默认值。
+# 新建行的初始执行态：接单默认「待确认」——申请刚提交时达人是否接单尚未确认，
+# 写「已接单」等于系统替达人签收（实测日报里出现“已接单 5 位”而员工并未反馈）。
+# 真实接单状态由 update_order_status 回写。
+PROMO_NEW_ROW_DEFAULTS = {"是否接单": "待确认", "是否打款": "待打款"}
+
+
+def promo_new_row_defaults(app_type: str) -> dict:
+    """新建行的初始执行态：接单「待确认」；只有垫付申请才涉及「打款」。"""
+    defaults = {"是否接单": "待确认"}
+    if app_type == "dianfu":
+        defaults["是否打款"] = "待打款"
+    return defaults
 
 
 def mgmt_record_fields(report: dict) -> dict:

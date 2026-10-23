@@ -14,15 +14,15 @@ from datetime import date as _date
 from typing import Dict, List
 
 from promo_agent import config
+from promo_agent.locks import file_lock
 from promo_agent.agent_tools import MASTER_TOOLS
 from promo_agent.feishu_client import FeishuClient, FeishuError
 from promo_agent.models import SongDailyReport
 from promo_agent.table_schema import (MGMT_TABLE, MGMT_FIELDS, PROMO_TABLE,
-                                      mgmt_record_fields, bitable_url)
+                                      PROMO_FIELDS, mgmt_record_fields, bitable_url)
 
 EVENT_BUS = config.STATE_DIR / "events.jsonl"
 PROCESSED = config.STATE_DIR / "processed_events.json"
-PROCESSED_LOCK = threading.Lock()   # 并发消费事件时保护游标文件
 _RUN_LOCK = threading.RLock()       # 串行化 聚合/日终/重算，防止后台任务与 23:00 定时重入
 
 
@@ -48,9 +48,6 @@ MASTER_SYSTEM_PROMPT = (
 )
 
 
-PROCESSED_LOCK = threading.Lock()   # 并发消费事件时保护游标文件
-
-
 class MasterAgent:
     name = config.MASTER_AGENT_NAME
 
@@ -62,14 +59,35 @@ class MasterAgent:
     def _load_processed(self):
         self.processed: List[str] = []
         if PROCESSED.exists():
-            self.processed = json.loads(PROCESSED.read_text(encoding="utf-8"))
+            try:
+                with file_lock(PROCESSED):
+                    self.processed = json.loads(PROCESSED.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                self.processed = []
 
     def _mark_processed(self, event_id: str):
-        with PROCESSED_LOCK:
-            if event_id not in self.processed:
-                self.processed.append(event_id)
-                PROCESSED.write_text(json.dumps(self.processed, ensure_ascii=False),
+        """标记事件已消费：跨进程互斥 + **锁内重读合并**。
+
+        原实现只在 threading.Lock 内操作实例内存列表再整文件覆盖；
+        每个 MasterAgent 实例都持有自己的一份 processed 快照，
+        多实例（listen 主循环 / 后台聚合线程 / CLI）并发标记时后写的会覆盖先写的，
+        导致游标丢事件 → 历史事件被反复消费、旧日报被重复推送（实测复现）。
+        现在把「读-判断-写」整体放进跨进程文件锁，并在锁内重读最新游标再合并。
+        """
+        if event_id in self.processed:
+            return
+        with file_lock(PROCESSED):
+            data = []
+            if PROCESSED.exists():
+                try:
+                    data = json.loads(PROCESSED.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    data = []
+            if event_id not in data:
+                data.append(event_id)
+                PROCESSED.write_text(json.dumps(data, ensure_ascii=False),
                                      encoding="utf-8")
+            self.processed = data
 
     def consume_events(self) -> List[dict]:
         if not EVENT_BUS.exists():
@@ -86,6 +104,7 @@ class MasterAgent:
     # ---------- 聚合 + 填表 + 汇报 ----------
     def aggregate(self, events: List[dict]) -> Dict[tuple, SongDailyReport]:
         grouped: Dict[tuple, SongDailyReport] = {}
+        events = self._explode_by_song(events)
         for ev in events:
             key = (ev["summary_date"], ev["records"][0]["song"])
             rep = grouped.setdefault(key, SongDailyReport(
@@ -115,27 +134,69 @@ class MasterAgent:
                     rep.expected_pay_date = ev.get("expected_pay_date", "")
             rep.warnings.extend(w for w in ev.get("warnings", []) if w not in rep.warnings)
 
-        # 打款情况文案
+        # 打款情况文案统一走 _build_pay_status，并且必须在审核剔除之后再生成
         for rep in grouped.values():
-            parts = []
-            if rep.doujia_total:
-                parts.append(f"抖加 ¥{rep.doujia_total:g} 已由「{rep.doujia_payer or '—'}」支付")
-            if rep.dianfu_total:
-                parts.append(f"垫付 ¥{rep.dianfu_total:g} 待打款"
-                             f"（打款人：{rep.dianfu_payer or '—'}"
-                             f"{f'，预计 {rep.expected_pay_date}' if rep.expected_pay_date else ''}）")
-            rep.pay_status = "；".join(parts) or "无"
+            self._build_pay_status(rep)
         return grouped
+
+    @staticmethod
+    def _build_pay_status(rep: SongDailyReport) -> SongDailyReport:
+        """按**当前**金额重建「打款情况」文案（纯函数）。
+
+        必须在 _apply_review_and_order() 之后调用：驳回剔除会修改
+        doujia_total / dianfu_total，若文案在剔除前生成，卡片就会出现
+        “抖加总花费 ¥260 / 打款情况 抖加 ¥660”这种自相矛盾的数字（实测复现）。
+        """
+        parts = []
+        if rep.doujia_total:
+            parts.append(f"抖加 ¥{rep.doujia_total:g} 已由「{rep.doujia_payer or '—'}」支付")
+        if rep.dianfu_total:
+            parts.append(f"垫付 ¥{rep.dianfu_total:g} 待打款"
+                         f"（打款人：{rep.dianfu_payer or '—'}"
+                         f"{f'，预计 {rep.expected_pay_date}' if rep.expected_pay_date else ''}）")
+        rep.pay_status = "；".join(parts) or "无"
+        return rep
+
+    @staticmethod
+    def _explode_by_song(events: List[dict]) -> List[dict]:
+        """把一个事件按歌曲拆成多个单曲事件（幂等）。
+
+        聚合键是 (日期, 歌曲)，而一段总结文本里可能混有多首歌的明细；
+        不按歌拆分会把后面歌曲的费用全部记到第一首歌头上（
+        aggregate 取 records[0]["song"] 作为整组键的历史 bug 根因）。
+        事件级字段（payer / warnings / summary_date 等）随拆分保留。
+        """
+        out: List[dict] = []
+        for ev in events:
+            records = ev.get("records") or []
+            songs: List[str] = []
+            for rec in records:
+                s = rec.get("song") or ""
+                if s not in songs:
+                    songs.append(s)
+            if len(songs) <= 1:
+                out.append(ev)
+                continue
+            for s in songs:
+                sub = dict(ev)
+                sub["records"] = [r for r in records if (r.get("song") or "") == s]
+                out.append(sub)
+        return out
+
 
     def _apply_review_and_order(self, rep: SongDailyReport):
         """读取《推广账号表》的真实接单/审核状态：
         - 已驳回的达人费用从本日报中剔除（审核流闭环，不计入口径）；
-        - 生成接单情况文案；剔除信息写入 warnings（卡片与核对备注可见）。"""
+        - 生成接单情况文案；剔除信息写入 warnings（卡片与核对备注可见）。
+        幂等：对同一 report 对象重复调用不会重复扣减。"""
         app_token = self.client.ensure_bitable()
         table_id = self.client.ensure_table(
             app_token, PROMO_TABLE,
-            __import__("promo_agent.table_schema", fromlist=["PROMO_FIELDS"]).PROMO_FIELDS)
+            PROMO_FIELDS)
         norm = self.client._to_write_format
+        if getattr(rep, "_review_applied", False):
+            return   # 幂等：同一 report 对象只处理一次，防止重复扣减费用
+        rep._review_applied = True
         status_map: dict = {}
         review_map: dict = {}
         for fields in self.client.search_records(app_token, table_id, "歌曲名", rep.song):
@@ -174,7 +235,7 @@ class MasterAgent:
         全量重算（而非增量累加）保证任何崩溃/重试场景下数字都正确；
         某个日期聚合失败时事件保留未处理状态，下次触发自动重试。
         """
-        events = self.consume_events()
+        events = self._explode_by_song(self.consume_events())
         if not events:
             print(f"[{self.name}] 暂无未处理事件。")
             return []
@@ -205,6 +266,7 @@ class MasterAgent:
             if key not in grouped:
                 continue   # 该日期历史事件重算结果仅用于覆盖旧值，无需重复推卡
             self._apply_review_and_order(rep)
+            self._build_pay_status(rep)   # 驳回剔除后重算文案，保证金额与文案一致
             fields = mgmt_record_fields(rep.to_dict())
             try:
                 rid = self.client.upsert_record(app_token, table_id, "报告键",
@@ -241,6 +303,7 @@ class MasterAgent:
         table_url = bitable_url(app_token, table_id)
         for rep in grouped.values():
             self._apply_review_and_order(rep)
+            self._build_pay_status(rep)   # 驳回剔除后重算文案，保证金额与文案一致
             fields = mgmt_record_fields(rep.to_dict())
             self.client.upsert_record(app_token, table_id, "报告键",
                                       f"{rep.summary_date}|{rep.song}", fields)
@@ -260,6 +323,7 @@ class MasterAgent:
         table_id = self.client.ensure_table(app_token, MGMT_TABLE, MGMT_FIELDS)
         for rep in grouped.values():
             self._apply_review_and_order(rep)
+            self._build_pay_status(rep)   # 驳回剔除后重算文案，保证金额与文案一致
             fields = mgmt_record_fields(rep.to_dict())
             self.client.upsert_record(app_token, table_id, "报告键",
                                       f"{rep.summary_date}|{rep.song}", fields)
@@ -298,12 +362,18 @@ class MasterToolExecutor:
                 reports = MasterAgent(self.client).run(send_report=True)
                 return {"reports": [r.to_dict() for r in reports] or ["暂无未汇总事件"]}
             if tool_name == "query_daily_reports":
+                # 一致性屏障：只要事件总线上还有未消费事件，就先同步聚合再查。
+                # 否则“提交后紧接着问账”会读到上一版日报（实测出现
+                # 抖加 260 / 垫付 0 与表格实际 500 矛盾的回答）。
+                agent = MasterAgent(self.client)
+                if agent.consume_events():
+                    agent.run(send_report=False)
                 result = self.client.fetch_mgmt_rows(
                     song=str(params.get("song") or ""),
                     date=str(params.get("date") or ""))
                 if not result.get("reports"):
-                    # 自愈：刚申请完日报还没生成（事件在总线待消费）——先聚合再查
-                    pending = MasterAgent(self.client).run(send_report=False)
+                    # 兜底自愈：仍然查不到就再强制聚合一次
+                    pending = agent.run(send_report=False)
                     if pending:
                         result = self.client.fetch_mgmt_rows(
                             song=str(params.get("song") or ""),

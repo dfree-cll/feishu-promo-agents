@@ -1,0 +1,294 @@
+# -*- coding: utf-8 -*-
+"""核心纯逻辑回归测试（零网络、零飞书凭证）。
+
+覆盖 4 类历史上真实踩过的坑：
+1. 工具参数校验器产物 与 工具实现签名 不一致（submit_application 少了 submitted_at）；
+2. listener 传了实现没有的参数（ingest_text 少了 msg_time）；
+3. 申请写入把 update_order_status / mark_paid 回写的真实状态冲回默认值；
+4. 聚合取 records[0]["song"] 当整组键，导致混歌事件的费用记错歌曲。
+"""
+import inspect
+
+import pytest
+
+from promo_agent import config
+from promo_agent import feishu_client as fc
+from promo_agent.extractor import parse_summary
+from promo_agent.master_agent import MasterAgent
+from promo_agent.models import ApplicationRecord, SongDailyReport, SummaryEvent
+from promo_agent.sub_agent import SubAgent, SubToolExecutor
+from promo_agent.table_schema import (PROMO_NEW_ROW_DEFAULTS, promo_new_row_defaults,
+                                      promo_record_fields)
+from promo_agent import validators as v
+
+
+# ------------------------------------------------------------------ 抽取 + 口径核对
+def _sample(name: str) -> str:
+    return (config.DATA_DIR / "samples" / name).read_text(encoding="utf-8")
+
+
+def test_parse_doujia_sample_counts_and_totals():
+    ev = parse_summary(_sample("sample_doujia.txt"))
+    assert ev.event_type == "doujia_summary"
+    assert ev.summary_date == "2026-09-02"
+    assert len(ev.records) == 4
+    assert ev.detail_total == 700          # 300 + 200 + 100 + 100
+    assert ev.detail_count == 7            # 分 3 笔 + 分 2 笔 + 1 + 1
+    assert ev.stated_total == 700
+    assert ev.payer == "爆火音乐"
+    assert ev.warnings == []               # 口径一致时不应告警
+
+
+def test_parse_warns_on_total_mismatch():
+    text = (
+        "【抖加金额统计】今日已支付：¥999（2026-09-02）\n\n"
+        "歌名：《你是我的仰望》- 博主名：初秋 - 金额：¥300\n"
+    )
+    ev = parse_summary(text)
+    assert any("金额口径不一致" in w for w in ev.warnings)
+
+
+# ------------------------------------------------------------------ 事件幂等
+def test_event_id_is_deterministic_and_content_addressed():
+    def make(amount: float) -> SummaryEvent:
+        return SummaryEvent(
+            event_type="doujia_summary", summary_date="2026-09-02", payer="爆火音乐",
+            records=[ApplicationRecord(song="你是我的仰望", blogger="初秋",
+                                       app_type="doujia", amount=amount, tx_count=1)],
+        )
+
+    assert make(300).event_id == make(300).event_id      # 同内容 -> 同 ID
+    assert make(300).event_id != make(301).event_id      # 内容变了 -> ID 变
+
+
+# ------------------------------------------------------------------ 签名一致性（防回归）
+def test_ingest_text_accepts_msg_time():
+    """listener 两个调用点都传 msg_time=，签名必须跟得上。"""
+    assert "msg_time" in inspect.signature(SubAgent.ingest_text).parameters
+    src = (config.PROJECT_ROOT / "promo_agent" / "listener.py").read_text(encoding="utf-8")
+    assert "msg_time=msg_time" in src
+
+
+def test_submit_application_accepts_all_validator_output():
+    """validators 产出的每个键，工具实现都必须能接住（否则 TypeError 被吞成模型重试）。"""
+    clean = v.validate_submit_args(
+        {"app_type": "doujia", "song": "你是我的仰望", "blogger": "初秋",
+         "amount": 300, "doujia_payer": "爆火音乐"},
+        "2026-09-02",
+    )
+    assert "submitted_at" in clean
+    # submit_application 实现位于 SubToolExecutor（工具执行器），不在 SubAgent 上
+    accepted = set(inspect.signature(SubToolExecutor.submit_application).parameters)
+    missing = set(clean) - accepted
+    assert not missing, f"submit_application 缺少参数: {missing}"
+
+
+# ------------------------------------------------------------------ 状态回写不被冲掉
+def test_promo_record_fields_does_not_write_execution_state():
+    """是否接单/是否打款 属执行态字段，不能由申请写入覆盖。"""
+    fields = promo_record_fields({
+        "row_key": "你是我的仰望|初秋", "song": "你是我的仰望", "blogger": "初秋",
+        "app_type": "doujia", "amount": 300, "tx_count": 3, "payer": "爆火音乐",
+        "summary_date": "2026-09-02", "submitted_at": "2026-09-02 10:00:00",
+        "expected_pay_date": "", "source": "推广群",
+    })
+    assert "是否接单" not in fields
+    assert "是否打款" not in fields
+    assert fields["提交时间"] == "2026-09-02 10:00:00"
+    # 申请刚提交时达人是否接单尚未确认，默认必须是「待确认」（0.7.3 修正）
+    assert PROMO_NEW_ROW_DEFAULTS["是否接单"] == "待确认"
+    # 抖加不涉及打款，默认值应按类型区分
+    assert promo_new_row_defaults("doujia") == {"是否接单": "待确认"}
+    assert promo_new_row_defaults("dianfu") == {"是否接单": "待确认", "是否打款": "待打款"}
+
+
+def test_upsert_defaults_only_apply_on_create(monkeypatch):
+    """新建行才写默认状态；已存在的行不能被后续申请把真实状态冲回去。"""
+    store = {"bitables": {}, "messages": []}
+    monkeypatch.setattr(fc, "_mock_load", lambda: store)
+    monkeypatch.setattr(fc, "_mock_save", lambda s: None)
+
+    c = fc.FeishuClient(mock=True)
+    app = c.ensure_bitable()
+    tid = c.ensure_table(app, "推广账号表", [])
+    defaults = {"是否接单": "已接单", "是否打款": "待打款"}
+
+    rid = c.upsert_record(app, tid, "行键", "A|初秋",
+                          {"行键": "A|初秋", "抖加金额": 100}, create_defaults=defaults)
+    records = store["bitables"][app]["tables"][tid]["records"]
+    assert records[rid]["是否接单"] == "已接单"       # 新建：补默认值
+
+    # 达人反馈拒接 -> 回写真实状态
+    c.upsert_record(app, tid, "行键", "A|初秋", {"行键": "A|初秋", "是否接单": "已拒绝"})
+    # 之后又有新申请写入同一行
+    c.upsert_record(app, tid, "行键", "A|初秋",
+                    {"行键": "A|初秋", "抖加金额": 200}, create_defaults=defaults)
+    assert records[rid]["是否接单"] == "已拒绝"       # 关键：不能被冲回已接单
+    assert records[rid]["抖加金额"] == 200
+
+
+# ------------------------------------------------------------------ 聚合正确性
+def _agent() -> MasterAgent:
+    """不连飞书地构造 MasterAgent（aggregate / _apply_review_and_order 都是纯逻辑）。"""
+    return MasterAgent.__new__(MasterAgent)
+
+
+def test_aggregate_splits_multi_song_event():
+    events = [{
+        "event_type": "doujia_summary", "summary_date": "2026-09-02",
+        "payer": "爆火音乐",
+        "records": [
+            {"song": "歌A", "blogger": "初秋", "amount": 100, "tx_count": 1},
+            {"song": "歌B", "blogger": "艳红", "amount": 200, "tx_count": 2},
+        ],
+    }]
+    grouped = _agent().aggregate(events)
+    assert set(grouped) == {("2026-09-02", "歌A"), ("2026-09-02", "歌B")}
+    assert grouped[("2026-09-02", "歌A")].doujia_total == 100
+    assert grouped[("2026-09-02", "歌B")].doujia_total == 200
+
+
+def test_explode_by_song_is_idempotent():
+    events = [{
+        "event_type": "doujia_summary", "summary_date": "2026-09-02", "payer": "p",
+        "records": [{"song": "歌A", "blogger": "a", "amount": 1, "tx_count": 1},
+                    {"song": "歌B", "blogger": "b", "amount": 2, "tx_count": 1}],
+    }]
+    once = MasterAgent._explode_by_song(events)
+    assert len(once) == 2
+    assert MasterAgent._explode_by_song(once) == once
+
+
+class _FakeFeishu:
+    """只实现 _apply_review_and_order 需要的三个方法。"""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def ensure_bitable(self):
+        return "app"
+
+    def ensure_table(self, *args, **kwargs):
+        return "tbl"
+
+    def search_records(self, *args, **kwargs):
+        return self._rows
+
+    @staticmethod
+    def _to_write_format(value):
+        return value
+
+
+def _rejected_report() -> SongDailyReport:
+    return SongDailyReport(
+        summary_date="2026-09-02", song="歌A",
+        doujia_total=300, doujia_tx=2, doujia_bloggers=["张三", "李四"],
+        doujia_by_blogger={"张三": 100, "李四": 200},
+        doujia_tx_by_blogger={"张三": 1, "李四": 1},
+    )
+
+
+def test_rejected_blogger_is_excluded_from_report():
+    agent = _agent()
+    agent.client = _FakeFeishu([
+        {"博主名": "张三", "是否接单": "已接单", "审核状态": "已驳回"},
+        {"博主名": "李四", "是否接单": "已接单", "审核状态": "已批准"},
+    ])
+    rep = _rejected_report()
+    agent._apply_review_and_order(rep)
+    assert rep.doujia_total == 200
+    assert rep.doujia_bloggers == ["李四"]
+    assert any("已驳回" in w for w in rep.warnings)
+
+
+def test_apply_review_and_order_is_idempotent():
+    agent = _agent()
+    agent.client = _FakeFeishu([
+        {"博主名": "张三", "是否接单": "已接单", "审核状态": "已驳回"},
+        {"博主名": "李四", "是否接单": "已接单", "审核状态": "已批准"},
+    ])
+    rep = _rejected_report()
+    agent._apply_review_and_order(rep)
+    agent._apply_review_and_order(rep)   # 重复调用不应再次扣减
+    assert rep.doujia_total == 200
+    assert rep.doujia_tx == 1
+    assert sum(1 for w in rep.warnings if "已驳回" in w) == 1
+
+
+# ------------------------------------------------------------------ 参数校验
+def test_validator_rejects_role_mixup_and_bad_amount():
+    with pytest.raises(ValueError):
+        v.validate_submit_args(
+            {"app_type": "doujia", "song": "s", "blogger": "b", "amount": 100,
+             "doujia_payer": "爆火音乐", "dianfu_payer": "林老师"}, "2026-09-02")
+    with pytest.raises(ValueError):
+        v.clean_amount(0)
+    with pytest.raises(ValueError):
+        v.validate_order_args({"status": "随便填"})
+
+
+def test_validator_clamps_tx_count():
+    assert v.clean_tx_count(0) == 1
+    assert v.clean_tx_count(1000) == 99
+
+# ------------------------------------------------------------------ 文案与金额一致（0.7.3 回归）
+def test_pay_status_recomputed_after_rejection():
+    """驳回剔除之后「打款情况」文案必须跟着重算。
+
+    实测 bug：抖加总花费扣到 260，文案仍写「抖加 ¥660」（差的是被驳回的 400），
+    同一张日报卡片里数字自相矛盾。
+    """
+    agent = _agent()
+    agent.client = _FakeFeishu([
+        {"博主名": "张三", "是否接单": "待确认", "审核状态": "已驳回"},
+        {"博主名": "李四", "是否接单": "待确认", "审核状态": "已批准"},
+    ])
+    rep = _rejected_report()
+    MasterAgent._build_pay_status(rep)      # 剔除前：文案含 ¥300
+    assert "¥300" in rep.pay_status
+
+    agent._apply_review_and_order(rep)      # 剔除被驳回的张三
+    MasterAgent._build_pay_status(rep)      # 剔除后必须重算文案
+    assert rep.doujia_total == 200
+    assert "¥200" in rep.pay_status
+    assert "¥300" not in rep.pay_status, "旧金额仍出现在打款文案里"
+
+
+def test_card_metric_survives_snapshot(monkeypatch, tmp_path):
+    """卡片数必须能由结构化日志重建（原来只加内存计数，快照重建即归零）。"""
+    from promo_agent import observability as obs
+
+    monkeypatch.setattr(obs, "RUNS_FILE", tmp_path / "runs.jsonl")
+    monkeypatch.setattr(obs, "ERRORS_FILE", tmp_path / "errors.jsonl")
+    monkeypatch.setattr(obs, "METRICS_FILE", tmp_path / "metrics.json")
+    obs.reset()
+    obs.observe_card()
+    obs.observe_card()
+    assert obs.snapshot()["cards_sent"] == 2
+
+
+def test_file_lock_is_reentrant_safe_across_threads(tmp_path):
+    """跨进程锁模块可用：同一进程内多线程串行进入临界区，计数不丢。"""
+    import threading
+    from promo_agent.locks import file_lock
+
+    target = tmp_path / "counter.txt"
+    target.write_text("0", encoding="utf-8")
+    errors = []
+
+    def worker():
+        try:
+            for _ in range(20):
+                with file_lock(target, timeout=5):
+                    v = int(target.read_text(encoding="utf-8"))
+                    target.write_text(str(v + 1), encoding="utf-8")
+        except Exception as e:      # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert not errors
+    assert int(target.read_text(encoding="utf-8")) == 80
