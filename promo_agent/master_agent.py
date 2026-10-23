@@ -22,6 +22,17 @@ from promo_agent.table_schema import (MGMT_TABLE, MGMT_FIELDS, PROMO_TABLE,
 
 EVENT_BUS = config.STATE_DIR / "events.jsonl"
 PROCESSED = config.STATE_DIR / "processed_events.json"
+PROCESSED_LOCK = threading.Lock()   # 并发消费事件时保护游标文件
+_RUN_LOCK = threading.RLock()       # 串行化 聚合/日终/重算，防止后台任务与 23:00 定时重入
+
+
+def _serialized(fn):
+    """装饰器：同一时刻只允许一个聚合/日终/重算任务在跑。"""
+    def wrapper(self, *args, **kwargs):
+        with _RUN_LOCK:
+            return fn(self, *args, **kwargs)
+    return wrapper
+
 
 MASTER_SYSTEM_PROMPT = (
     "你是音乐宣推团队的「综合助手」（Master-Agent），服务对象是管理者/部门负责人。\n"
@@ -80,17 +91,26 @@ class MasterAgent:
             rep = grouped.setdefault(key, SongDailyReport(
                 summary_date=ev["summary_date"], song=key[1]))
             for rec in ev["records"]:
+                blogger = rec["blogger"]
                 if ev["event_type"] == "doujia_summary":
                     rep.doujia_total = round(rep.doujia_total + rec["amount"], 2)
                     rep.doujia_tx += rec["tx_count"]
-                    if rec["blogger"] not in rep.doujia_bloggers:
-                        rep.doujia_bloggers.append(rec["blogger"])
+                    if blogger not in rep.doujia_bloggers:
+                        rep.doujia_bloggers.append(blogger)
+                    rep.doujia_by_blogger[blogger] = round(
+                        rep.doujia_by_blogger.get(blogger, 0) + rec["amount"], 2)
+                    rep.doujia_tx_by_blogger[blogger] = (
+                        rep.doujia_tx_by_blogger.get(blogger, 0) + rec["tx_count"])
                     rep.doujia_payer = ev["payer"]
                 else:
                     rep.dianfu_total = round(rep.dianfu_total + rec["amount"], 2)
                     rep.dianfu_tx += rec["tx_count"]
-                    if rec["blogger"] not in rep.dianfu_bloggers:
-                        rep.dianfu_bloggers.append(rec["blogger"])
+                    if blogger not in rep.dianfu_bloggers:
+                        rep.dianfu_bloggers.append(blogger)
+                    rep.dianfu_by_blogger[blogger] = round(
+                        rep.dianfu_by_blogger.get(blogger, 0) + rec["amount"], 2)
+                    rep.dianfu_tx_by_blogger[blogger] = (
+                        rep.dianfu_tx_by_blogger.get(blogger, 0) + rec["tx_count"])
                     rep.dianfu_payer = ev["payer"]
                     rep.expected_pay_date = ev.get("expected_pay_date", "")
             rep.warnings.extend(w for w in ev.get("warnings", []) if w not in rep.warnings)
@@ -107,27 +127,47 @@ class MasterAgent:
             rep.pay_status = "；".join(parts) or "无"
         return grouped
 
-    def _order_status_text(self, song: str, bloggers: list) -> str:
-        """从《推广账号表》读取真实“是否接单”状态并汇总成文案。"""
+    def _apply_review_and_order(self, rep: SongDailyReport):
+        """读取《推广账号表》的真实接单/审核状态：
+        - 已驳回的达人费用从本日报中剔除（审核流闭环，不计入口径）；
+        - 生成接单情况文案；剔除信息写入 warnings（卡片与核对备注可见）。"""
         app_token = self.client.ensure_bitable()
         table_id = self.client.ensure_table(
             app_token, PROMO_TABLE,
             __import__("promo_agent.table_schema", fromlist=["PROMO_FIELDS"]).PROMO_FIELDS)
+        norm = self.client._to_write_format
         status_map: dict = {}
-        for fields in self.client.search_records(app_token, table_id, "歌曲名", song):
-            norm = self.client._to_write_format
+        review_map: dict = {}
+        for fields in self.client.search_records(app_token, table_id, "歌曲名", rep.song):
             blogger = norm(fields.get("博主名", ""))
-            status = norm(fields.get("是否接单", "")) or "待确认"
-            if blogger:
-                status_map[blogger] = status
+            if not blogger:
+                continue
+            status_map[blogger] = norm(fields.get("是否接单", "")) or "待确认"
+            review_map[blogger] = norm(fields.get("审核状态", ""))
+
+        rejected = [b for b in rep.all_bloggers if review_map.get(b) == "已驳回"]
+        for b in rejected:
+            if b in rep.doujia_bloggers:
+                rep.doujia_total = round(rep.doujia_total - rep.doujia_by_blogger.get(b, 0), 2)
+                rep.doujia_tx -= rep.doujia_tx_by_blogger.get(b, 0)
+                rep.doujia_bloggers.remove(b)
+            if b in rep.dianfu_bloggers:
+                rep.dianfu_total = round(rep.dianfu_total - rep.dianfu_by_blogger.get(b, 0), 2)
+                rep.dianfu_tx -= rep.dianfu_tx_by_blogger.get(b, 0)
+                rep.dianfu_bloggers.remove(b)
+        if rejected:
+            rep.warnings.append("已驳回（不计入本日报）：" + "、".join(rejected))
+
         by_status: dict = {}
-        for b in bloggers:
+        for b in rep.all_bloggers:
             by_status.setdefault(status_map.get(b, "待确认"), []).append(b)
         if not by_status:
-            return "暂无达人记录"
-        parts = [f"{s} {len(bs)} 位（{'、'.join(bs)}）" for s, bs in by_status.items()]
-        return "；".join(parts)
+            rep.order_status = "暂无达人记录"
+        else:
+            rep.order_status = "；".join(
+                f"{s} {len(bs)} 位（{'、'.join(bs)}）" for s, bs in by_status.items())
 
+    @_serialized
     def run(self, send_report: bool = True) -> List[SongDailyReport]:
         """即时增量入口：消费未处理事件，并对受影响的日期做【全量重算】。
 
@@ -164,7 +204,7 @@ class MasterAgent:
         for key, rep in full_grouped.items():
             if key not in grouped:
                 continue   # 该日期历史事件重算结果仅用于覆盖旧值，无需重复推卡
-            rep.order_status = self._order_status_text(rep.song, rep.all_bloggers)
+            self._apply_review_and_order(rep)
             fields = mgmt_record_fields(rep.to_dict())
             try:
                 rid = self.client.upsert_record(app_token, table_id, "报告键",
@@ -178,6 +218,7 @@ class MasterAgent:
                 self._mark_processed(ev["event_id"])
         return [rep for key, rep in full_grouped.items() if key in grouped]
 
+    @_serialized
     def daily_summary(self, day: str = "") -> List[SongDailyReport]:
         """日终总结：重算某天的全部申请并推送终版日报（对应需求“23点总结当日情况”）。
 
@@ -199,7 +240,7 @@ class MasterAgent:
         table_id = self.client.ensure_table(app_token, MGMT_TABLE, MGMT_FIELDS)
         table_url = bitable_url(app_token, table_id)
         for rep in grouped.values():
-            rep.order_status = self._order_status_text(rep.song, rep.all_bloggers)
+            self._apply_review_and_order(rep)
             fields = mgmt_record_fields(rep.to_dict())
             self.client.upsert_record(app_token, table_id, "报告键",
                                       f"{rep.summary_date}|{rep.song}", fields)
@@ -207,6 +248,7 @@ class MasterAgent:
             self._card_to_manager(rep, True, table_url)
         return list(grouped.values())
 
+    @_serialized
     def rebuild(self) -> List[SongDailyReport]:
         """从事件总线全量重算所有日报（修复历史数据/口径变更时使用）。"""
         if not EVENT_BUS.exists():
@@ -217,7 +259,7 @@ class MasterAgent:
         app_token = self.client.ensure_bitable()
         table_id = self.client.ensure_table(app_token, MGMT_TABLE, MGMT_FIELDS)
         for rep in grouped.values():
-            rep.order_status = self._order_status_text(rep.song, rep.all_bloggers)
+            self._apply_review_and_order(rep)
             fields = mgmt_record_fields(rep.to_dict())
             self.client.upsert_record(app_token, table_id, "报告键",
                                       f"{rep.summary_date}|{rep.song}", fields)

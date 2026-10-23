@@ -320,6 +320,7 @@ class FeishuClient:
                         "douyin_id": norm(f.get("抖音号", "")),
                         "quote": norm(f.get("报价", "")),
                         "publish_date": norm(f.get("发布日期", "")),
+                        "review": norm(f.get("审核状态", "")),
                         "doujia": norm(f.get("抖加金额", "")),
                         "dianfu": norm(f.get("垫付金额", "")),
                         "pay_status": norm(f.get("是否打款", "")),

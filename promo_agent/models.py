@@ -3,7 +3,7 @@
 import json
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from typing import List
+from typing import Dict, List
 
 DOUJIA = "doujia"      # 抖加申请
 DIANFU = "dianfu"      # 垫付/付款申请
@@ -96,6 +96,10 @@ class SongDailyReport:
     dianfu_tx: int = 0
     doujia_bloggers: List[str] = field(default_factory=list)
     dianfu_bloggers: List[str] = field(default_factory=list)
+    doujia_by_blogger: Dict[str, float] = field(default_factory=dict)   # 博主 -> 金额（供审核剔除）
+    dianfu_by_blogger: Dict[str, float] = field(default_factory=dict)
+    doujia_tx_by_blogger: Dict[str, int] = field(default_factory=dict)
+    dianfu_tx_by_blogger: Dict[str, int] = field(default_factory=dict)
     doujia_payer: str = ""
     dianfu_payer: str = ""
     expected_pay_date: str = ""

@@ -28,18 +28,15 @@ _EVENT_LOCK = threading.Lock()   # 多消息并发时保护事件总线文件追
 
 import threading
 
-_MASTER_LOCK = threading.Lock()
-
-
 def _run_master_async(client: FeishuClient):
-    """Master 聚合/日报转后台线程执行：用户不等它，绿色日报卡片稍后自动出现。"""
+    """Master 聚合/日报转后台线程执行：用户不等它，绿色日报卡片稍后自动出现。
+    并发串行化由 MasterAgent 内部的 _RUN_LOCK 保证。"""
     def _job():
-        with _MASTER_LOCK:
-            try:
-                from promo_agent.master_agent import MasterAgent
-                MasterAgent(client).run(send_report=True)
-            except Exception as e:
-                print(f"[Master-Agent] 后台汇总失败：{e}")
+        try:
+            from promo_agent.master_agent import MasterAgent
+            MasterAgent(client).run(send_report=True)
+        except Exception as e:
+            print(f"[Master-Agent] 后台汇总失败：{e}")
     threading.Thread(target=_job, daemon=True, name="master-summary").start()
 
 SUB_SYSTEM_PROMPT = (
