@@ -327,13 +327,16 @@ def handle_question(question: str, client: FeishuClient = None) -> str:
     import time as _time
     from promo_agent.llm_client import run_tool_loop, llm_ready
     from promo_agent import observability as obs
+    from promo_agent.models import business_today
     if not llm_ready():
         return "（未配置 LLM，无法智能问答。可运行 python -m main summary 生成规则版日报）"
     run_id = obs.new_run_id("master")
     obs.set_current_run(run_id)
     obs.log_event("master_question", run_id=run_id, question=question[:120])
     t0 = _time.time()
-    messages = [{"role": "system", "content": MASTER_SYSTEM_PROMPT},
+    messages = [{"role": "system",
+                 "content": MASTER_SYSTEM_PROMPT + f"\n【当前业务日】{business_today()}"
+                           "（23:00 后提交的申请计入下一业务日）"},
                 {"role": "user", "content": question}]
     answer = run_tool_loop(
         messages, MASTER_TOOLS, MasterToolExecutor(client).run_tool,

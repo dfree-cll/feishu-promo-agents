@@ -10,7 +10,6 @@ Sub-Agent「推广助手」——真正的 LLM Agent：
 """
 import json
 import threading
-from datetime import date as _date
 from typing import List, Optional
 
 from promo_agent import config
@@ -18,11 +17,10 @@ from promo_agent import memory
 from promo_agent.agent_tools import SUB_TOOLS
 from promo_agent.feishu_client import FeishuClient
 from promo_agent.extractor import parse_any
-from promo_agent.models import ApplicationRecord, SummaryEvent
+from promo_agent.models import ApplicationRecord, SummaryEvent, business_today
 from promo_agent.table_schema import PROMO_TABLE, PROMO_FIELDS, promo_record_fields
 
 EVENT_BUS = config.STATE_DIR / "events.jsonl"      # Sub -> Master 的结构化事件通道
-TODAY = _date.today().isoformat()
 
 _EVENT_LOCK = threading.Lock()   # 多消息并发时保护事件总线文件追加
 
@@ -41,7 +39,8 @@ def _run_master_async(client: FeishuClient):
 
 SUB_SYSTEM_PROMPT = (
     "你是音乐宣推团队的「推广助手」（Sub-Agent），常驻公司【推广群】。\n"
-    f"今天是 {TODAY}。\n"
+    "截账规则：每天 23:00 日终截账，之后提交的申请计入下一业务日"
+    "（当前业务日以系统提示为准）。\n"
     "员工会用各种口语化方式提交「抖加」或「垫付（付款）」申请，也可能询问歌曲推广情况，\n"
     "或反馈达人接单/打款的状态变化。\n"
     "你的工作准则：\n"
@@ -86,10 +85,13 @@ class SubAgent:
         obs.set_current_run(run_id)
         obs.log_event("agent_run_start", run_id=run_id, message=text[:120], sender=sender)
         t0 = _time.time()
+        biz_day = business_today()
         history = memory.get_recent_turns(chat_id, 6)
         if history:
             obs.log_event("memory_context", run_id=run_id, turns=len(history))
-        messages = [{"role": "system", "content": SUB_SYSTEM_PROMPT}]
+        messages = [{"role": "system",
+                     "content": SUB_SYSTEM_PROMPT + f"\n【当前业务日】{biz_day}"
+                               "（23:00 后提交的申请计入下一业务日）"}]
         messages += history
         messages.append({"role": "user", "content": text})
         executor = SubToolExecutor(self).bind(chat_id=chat_id, sender=sender)
@@ -187,7 +189,7 @@ class SubToolExecutor:
         from promo_agent import validators as v
         try:
             if tool_name == "submit_application":
-                clean = v.validate_submit_args(params, TODAY)
+                clean = v.validate_submit_args(params, business_today())
                 return self.submit_application(**clean)
             if tool_name == "lookup_promo_table":
                 return self.client.fetch_promo_rows(
@@ -203,7 +205,7 @@ class SubToolExecutor:
                     out["answer_text"] = f"已将《{song}》的「{blogger}」接单状态更新为：{out['order_status']}。"
                 return out
             if tool_name == "mark_paid":
-                clean = v.validate_paid_args(params, TODAY)
+                clean = v.validate_paid_args(params, business_today())
                 out = self.mark_paid(
                     song=v.clean_text(params, "song"),
                     blogger=v.clean_text(params, "blogger"),

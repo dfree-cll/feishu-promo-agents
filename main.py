@@ -83,12 +83,15 @@ def cmd_ingest(args):
 
 
 def cmd_summary(args):
-    """日终总结：重算当日全部申请并推送终版日报（对应需求“23点总结当日情况”）。"""
-    from datetime import date as _date
-    day = _date.today().isoformat()
+    """日终总结：重算当前业务日全部申请并推送终版日报。
+
+    业务日切账：每天 23:00 截账，23:00 后手动执行会自动计入下一业务日。
+    """
+    from promo_agent.models import business_today
+    day = business_today()
     reports = MasterAgent().daily_summary(day)
     if not reports:
-        print(f"{day} 当日无申请记录。")
+        print(f"{day} 业务日无申请记录。")
 
 
 def cmd_listen(args):

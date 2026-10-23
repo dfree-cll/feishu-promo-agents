@@ -2,8 +2,10 @@
 """数据模型：申请明细、Sub→Master 结构化事件、聚合报告。"""
 import json
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List
+
+from promo_agent import config
 
 DOUJIA = "doujia"      # 抖加申请
 DIANFU = "dianfu"      # 垫付/付款申请
@@ -12,6 +14,19 @@ TYPE_LABEL = {DOUJIA: "抖加", DIANFU: "垫付"}
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def business_today(now: datetime = None) -> str:
+    """当前业务日（ISO 日期）。
+
+    截账规则：每天 config.BUSINESS_DAY_CUTOFF_HOUR（默认 23）点之后提交的申请，
+    计入下一业务日。未指定日期的申请默认使用该值。
+    """
+    now = now or datetime.now()
+    d = now.date()
+    if now.hour >= config.BUSINESS_DAY_CUTOFF_HOUR:
+        d += timedelta(days=1)
+    return d.isoformat()
 
 
 @dataclass
