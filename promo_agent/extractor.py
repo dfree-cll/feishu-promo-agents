@@ -159,6 +159,12 @@ def parse_summary(text: str, source: str = "推广群") -> SummaryEvent:
             warnings.append(
                 f"笔数口径不一致：汇总文本为 {stated_count} 笔，明细合计 {detail_count} 笔，需人工核对")
 
+    # 第三个物料坑：预计打款日期早于申请日期 —— 钱还没申请就先"预计打款"了
+    if expected and summary_date and expected < summary_date:
+        warnings.append(
+            f"日期口径异常：预计打款日期 {expected} 早于申请日期 {summary_date}，"
+            f"疑似笔误，需人工核对")
+
     event_type = "doujia_summary" if app_type == DOUJIA else "dianfu_summary"
     return SummaryEvent(
         event_type=event_type, summary_date=summary_date, records=records,

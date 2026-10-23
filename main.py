@@ -83,12 +83,14 @@ def cmd_ingest(args):
 
 
 def cmd_summary(args):
-    """日终总结：重算当前业务日全部申请并推送终版日报。
+    """日终总结：重算指定业务日（默认今天）的全部申请并推送终版日报。
 
     业务日切账：每天 23:00 截账，23:00 后手动执行会自动计入下一业务日。
+    `--date` 用于重算历史某天——物料/样例常是过去日期，演示时必须能指定，
+    否则凌晨或隔天回放会得到"当日无申请记录"。
     """
     from promo_agent.models import business_today
-    day = business_today()
+    day = getattr(args, "date", "") or business_today()
     reports = MasterAgent().daily_summary(day)
     if not reports:
         print(f"{day} 业务日无申请记录。")
@@ -257,7 +259,11 @@ def main():
     p = sub.add_parser("ingest", help="摄入申请总结文本")
     p.add_argument("--file"); p.add_argument("--text")
     p.set_defaults(func=cmd_ingest)
-    sub.add_parser("summary", help="Master 日终总结（当日全量）").set_defaults(func=cmd_summary)
+    p = sub.add_parser("summary",
+                       help="Master 日终总结（默认当前业务日，可用 --date 指定某一天）")
+    p.add_argument("--date", default="",
+                   help="业务日 YYYY-MM-DD；要重算历史某天（如物料日期）时用它")
+    p.set_defaults(func=cmd_summary)
     sub.add_parser("listen", help="监听群消息（@机器人 实时触发）").set_defaults(func=cmd_listen)
     sub.add_parser("schedule", help="常驻定时（每天23:00）").set_defaults(func=cmd_schedule)
     sub.add_parser("entrance", help="发送表格入口卡片（可置顶）").set_defaults(func=cmd_entrance)

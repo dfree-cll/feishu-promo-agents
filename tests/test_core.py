@@ -599,3 +599,42 @@ def test_nonretryable_write_error_stops_tool_loop(monkeypatch):
     out = llm_client.run_tool_loop([{"role": "user", "content": "提交"}], [], executor)
     assert "人工核对" in out
     assert calls["chat"] == 1       # 只调一次模型就终止，没有给它重试机会
+
+# ------------------------------------------------------------------ 0.7.9：日期校验与 --date
+def test_expected_pay_date_before_summary_date_warns():
+    """物料第三个坑：预计打款日期早于申请日期（钱还没申请就先"预计打款"）要告警。"""
+    text = ("【垫付统计】今日已垫付：¥950（2026-09-03）\n"
+            "申请为【达人：初秋】垫付 ¥950（歌曲《你是我的仰望》）\n"
+            "打款人：林老师\n"
+            "预计打款日期：26/08/31")
+    ev = parse_summary(text)
+    assert ev.expected_pay_date == "2026-08-31"
+    assert any("日期口径异常" in w for w in ev.warnings)
+
+
+def test_expected_pay_date_after_summary_date_is_silent():
+    """预计打款日期晚于申请日期是正常业务，不应告警。"""
+    text = ("【垫付统计】今日已垫付：¥950（2026-09-03）\n"
+            "申请为【达人：初秋】垫付 ¥950（歌曲《A》）\n"
+            "打款人：林老师\n"
+            "预计打款日期：26/09/10")
+    ev = parse_summary(text)
+    assert not any("日期口径异常" in w for w in ev.warnings)
+
+
+def test_cmd_summary_accepts_date(monkeypatch):
+    """`summary --date` 必须真的把指定日期传给 daily_summary（物料跨天演示靠它）。"""
+    from types import SimpleNamespace
+
+    import main as cli
+
+    captured = {}
+
+    class _FakeMaster:
+        def daily_summary(self, day):
+            captured["day"] = day
+            return []
+
+    monkeypatch.setattr(cli, "MasterAgent", _FakeMaster)
+    cli.cmd_summary(SimpleNamespace(date="2026-09-02"))
+    assert captured["day"] == "2026-09-02"
